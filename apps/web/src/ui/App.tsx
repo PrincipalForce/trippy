@@ -6,6 +6,7 @@ import { buildWaveform, type Waveform } from "../audio/waveform-cache";
 import { createProjectStore } from "../project/store";
 import { Timeline } from "./timeline/Timeline";
 import { AiPanel } from "./ai/AiPanel";
+import { RecordButton } from "./RecordButton";
 import { opfsAvailable, saveProject, loadProject, listProjects } from "../project/opfs";
 
 export function App() {
@@ -278,6 +279,7 @@ export function App() {
           />
         </label>
         <FilePicker onFile={loadFile} disabled={busy()} />
+        <RecordButton onRecording={loadFile} onError={setError} disabled={busy()} />
         <Show when={opfsAvailable()}>
           <button onClick={save} disabled={busy()} title="Save to browser storage">
             ↓ Save
