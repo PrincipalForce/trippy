@@ -1,6 +1,7 @@
 import { createSignal, onCleanup, onMount, Show, For, createMemo } from "solid-js";
 import { getController } from "../audio/controller";
 import { decodeAudio } from "../audio/decode";
+import { encodeWavPcm16 } from "../audio/wav-encode";
 import { buildWaveform, type Waveform } from "../audio/waveform-cache";
 import { createProjectStore } from "../project/store";
 import { Timeline } from "./timeline/Timeline";
@@ -48,15 +49,26 @@ export function App() {
     setBusy(true);
     try {
       await controller.resume();
-      const bytes = await file.arrayBuffer();
+      const rawBytes = await file.arrayBuffer();
 
-      // 1) Push raw bytes to engine worker for playback
-      const engineSrc = await controller.loadWav(bytes);
-      // 2) Decode for visualization
-      const decoded = await decodeAudio(bytes);
+      // 1) Decode the file via the browser. Handles wav, mp3, m4a (iOS
+      //    Voice Memos), flac, ogg — anything the host AudioContext
+      //    understands. The engine only ingests WAV, so we re-encode after.
+      const decoded = await decodeAudio(rawBytes);
+
+      // 2) Re-encode to 16-bit PCM WAV in memory. Cheap and keeps the
+      //    project bundle on disk format-uniform.
+      const wavBytes = encodeWavPcm16(decoded.channels, decoded.sampleRate);
+
+      // 3) Send the WAV to the engine worker for playback
+      const engineSrc = await controller.loadWav(wavBytes);
+
+      // 4) Build waveform peaks for the timeline
       const wf = buildWaveform(decoded.channels, decoded.sampleRate);
 
-      // 3) Register in project model
+      // 5) Register in the project model. Save the re-encoded WAV (not
+      //    rawBytes) so reload uses the same canonical bytes — m4a files
+      //    don't survive a project export to another browser/runtime.
       const projSourceId = (project.state.project.sources.at(-1)?.id ?? 0) + 1;
       project.addSource({
         id: projSourceId,
@@ -67,7 +79,7 @@ export function App() {
         originalName: file.name,
       });
       engineSourceIds.set(projSourceId, engineSrc.sourceId);
-      sourceBytes.set(projSourceId, bytes);
+      sourceBytes.set(projSourceId, wavBytes);
       setWaveforms((m) => {
         const next = new Map(m);
         next.set(projSourceId, wf);
@@ -387,7 +399,11 @@ function FilePicker(props: { onFile: (file: File) => void; disabled?: boolean })
       <input
         ref={(el) => (inputRef = el)}
         type="file"
-        accept="audio/wav,.wav,audio/*"
+        // Broad accept so the iOS / Android file picker surfaces Voice
+        // Memos (.m4a), recordings, sample libraries — anything an
+        // AudioContext can decode. Explicit extensions help platforms
+        // that don't honor the wildcard fully.
+        accept="audio/*,.wav,.mp3,.m4a,.aac,.flac,.ogg,.opus,.weba"
         style={{ display: "none" }}
         onChange={(e) => {
           const f = e.currentTarget.files?.[0];
