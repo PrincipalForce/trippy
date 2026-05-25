@@ -17,11 +17,10 @@ target/
 Cargo.lock.bak
 
 # --- Generated WASM artifacts ---
-# wasm-pack writes apps/web/src/engine/pkg/. We DO commit that directory so
-# deploy hosts without a Rust toolchain (Launchmatic, generic Node PaaS,
-# preview environments) can build the web app from a pure-Node pipeline.
-# Regenerate with `pnpm build:engine` whenever the Rust engine changes — the
-# build script strips wasm-pack's own .gitignore so the artifacts get tracked.
+# wasm-pack writes here from `pnpm build:engine`. Not committed: the
+# production image (see Dockerfile) builds it from source in a Rust stage,
+# and local devs run `pnpm build:engine` once after cloning.
+apps/web/src/engine/pkg/
 
 # --- AI model weights ---
 # Large (>100 MB) ONNX/PT/GGUF files belong on a CDN, not in git.

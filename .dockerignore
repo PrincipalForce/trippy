@@ -1,0 +1,68 @@
+# Everything that should never enter the Docker build context.
+#
+# Keeping this list tight keeps the upload phase fast (a few MB instead of
+# hundreds) and avoids cache invalidation when local-only files change.
+
+# Dependencies
+node_modules
+**/node_modules
+.pnpm-store
+
+# Build output (the Dockerfile regenerates from source)
+target
+**/target
+dist
+**/dist
+.vite
+.turbo
+*.tsbuildinfo
+
+# Generated wasm — the Dockerfile produces this in stage 1
+apps/web/src/engine/pkg
+
+# Git / CI metadata
+.git
+.gitignore
+.github
+.gitattributes
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.swp
+.history
+
+# Logs + scratch
+*.log
+trippy-qr.png
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Docs not needed inside the image
+docs
+*.md
+LICENSE-*
+!apps/web/public/icons/README.md
+
+# Cloud / infra scratch
+.wrangler
+infra/workers/*/.wrangler
+infra/workers/*/dist
+
+# Tauri / Capacitor (future)
+src-tauri/target
+ios
+android
+
+# Tests output
+coverage
+.nyc_output
+.vitest-cache
+playwright-report
+test-results

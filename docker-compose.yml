@@ -1,0 +1,16 @@
+# Local equivalent of the production deploy:
+#
+#   docker compose up --build
+#
+# Then open http://localhost:8080 — same nginx serving the same bundle a
+# Launchmatic / Cloud Run deploy would produce.
+
+services:
+  trippy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trippy:local
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

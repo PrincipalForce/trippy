@@ -89,6 +89,31 @@ pnpm build                 # production web bundle
 pnpm icons                 # regenerate PWA icons from favicon.svg
 ```
 
+## Deploy with Docker
+
+The repo ships a multi-stage `Dockerfile` that:
+
+1. Builds the Rust engine to wasm (rust:1.83-slim + wasm-pack)
+2. Builds the SolidJS bundle (node:20-alpine + pnpm)
+3. Serves the static output via nginx with the COOP/COEP/CORP headers the
+   audio engine requires
+
+```bash
+# Local smoke test — matches what a Cloud Run / Launchmatic deploy produces
+docker compose up --build
+# → http://localhost:8080
+```
+
+Or build and push manually:
+
+```bash
+docker build -t trippy:latest .
+docker run --rm -p 8080:8080 trippy:latest
+```
+
+The container listens on port `8080` (the convention for Cloud Run, Fly,
+Render, and most modern PaaS). No build args, no env vars required.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The project is early enough that
