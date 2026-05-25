@@ -1,0 +1,102 @@
+# --- Dependencies ---
+node_modules/
+.pnpm-store/
+
+# --- Build output ---
+dist/
+build/
+out/
+.vite/
+.turbo/
+.tsbuildinfo
+*.tsbuildinfo
+
+# --- Rust ---
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# --- Generated WASM artifacts ---
+# wasm-pack writes here from `pnpm build:engine`; regenerated on every build.
+apps/web/src/engine/pkg/
+
+# --- AI model weights ---
+# Large (>100 MB) ONNX/PT/GGUF files belong on a CDN, not in git.
+# Downloaded on first use and cached in OPFS (see apps/web/src/ai/).
+*.onnx
+*.pt
+*.gguf
+*.safetensors
+apps/web/public/models/
+
+# --- Local audio fixtures ---
+# Drop personal samples into apps/web/public/test-audio/ for local dev
+# without committing them.
+apps/web/public/test-audio/
+
+# --- WAM plugins (M9) ---
+# Bundled plugins live under apps/web/public/plugins/; the manifest is
+# committed but third-party plugin payloads are not.
+apps/web/public/plugins/*/
+!apps/web/public/plugins/.gitkeep
+!apps/web/public/plugins/index.json
+
+# --- Cloudflare Workers (M8) ---
+.wrangler/
+infra/workers/*/.wrangler/
+infra/workers/*/dist/
+
+# --- Tauri (future desktop builds) ---
+src-tauri/target/
+src-tauri/Cargo.lock
+
+# --- Capacitor (future mobile builds) ---
+ios/App/Pods/
+ios/App/build/
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
+android/captures/
+
+# --- Local QR / scratch ---
+trippy-qr.png
+*.local.log
+
+# --- Test / coverage ---
+coverage/
+.nyc_output/
+.vitest-cache/
+playwright-report/
+test-results/
+
+# --- Env / secrets ---
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# --- Logs ---
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- Editor / OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+!.vscode/launch.json.example
+*.swp
+*.swo
+.history/
+
+# --- pnpm / npm scratch ---
+.pnpm-debug.log
+.npm/

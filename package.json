@@ -1,0 +1,25 @@
+{
+  "name": "trippy",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Mobile-first next-generation ACID-style DAW.",
+  "packageManager": "pnpm@10.24.0",
+  "scripts": {
+    "dev": "pnpm --filter @trippy/web dev",
+    "build": "pnpm --filter @trippy/web build",
+    "build:engine": "wasm-pack build crates/trippy-engine --target web --out-dir ../../apps/web/src/engine/pkg --release",
+    "build:engine:dev": "wasm-pack build crates/trippy-engine --target web --out-dir ../../apps/web/src/engine/pkg --dev",
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "test": "pnpm -r --if-present run test",
+    "test:rust": "cargo test --workspace",
+    "lint:rust": "cargo clippy --workspace --all-targets -- -D warnings",
+    "fmt:rust": "cargo fmt --all",
+    "fmt:rust:check": "cargo fmt --all -- --check"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

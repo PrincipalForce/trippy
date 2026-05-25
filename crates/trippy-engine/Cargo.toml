@@ -1,0 +1,27 @@
+[package]
+name = "trippy-engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "trippy DSP core — sample-accurate audio graph, transport, clip engine."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = ["console"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+trippy-dsp-prims = { path = "../trippy-dsp-prims" }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[features]
+default = []
+# Enables panic hook + verbose logging for browser debugging.
+debug = []

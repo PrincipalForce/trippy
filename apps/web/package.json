@@ -1,0 +1,26 @@
+{
+  "name": "@trippy/web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@trippy/format": "workspace:*",
+    "solid-js": "^1.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.5",
+    "vite-plugin-pwa": "^0.21.1",
+    "vite-plugin-solid": "^2.11.0",
+    "vitest": "^2.1.8",
+    "workbox-window": "^7.3.0"
+  }
+}
