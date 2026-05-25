@@ -76,11 +76,17 @@ RUN pnpm --filter @trippy/web build
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 3 — Serve the static bundle with nginx.
-#           COOP/COEP headers are mandatory: the audio engine relies on
-#           SharedArrayBuffer, which the browser only exposes in a
-#           cross-origin-isolated context.
+#
+# Uses the official `nginx-unprivileged` image: same nginx, but runs as the
+# non-root `nginx` user (UID 101) and listens on 8080 by default. Required
+# for Cloud Run, GKE Autopilot, and any host that refuses root containers —
+# and it's strictly better hygiene than running web servers as root.
+#
+# COOP/COEP/CORP headers are mandatory: the audio engine relies on
+# SharedArrayBuffer, which the browser only exposes in a cross-origin-isolated
+# context.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM nginx:1.27-alpine AS runtime
+FROM nginxinc/nginx-unprivileged:1.27-alpine AS runtime
 
 COPY infra/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=web-builder /app/apps/web/dist /usr/share/nginx/html
