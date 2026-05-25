@@ -3,6 +3,11 @@
   "private": true,
   "version": "0.0.0",
   "description": "Mobile-first next-generation ACID-style DAW.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/principalforce/trippy.git"
+  },
   "packageManager": "pnpm@10.24.0",
   "scripts": {
     "dev": "pnpm --filter @trippy/web dev",
@@ -14,9 +19,11 @@
     "test:rust": "cargo test --workspace",
     "lint:rust": "cargo clippy --workspace --all-targets -- -D warnings",
     "fmt:rust": "cargo fmt --all",
-    "fmt:rust:check": "cargo fmt --all -- --check"
+    "fmt:rust:check": "cargo fmt --all -- --check",
+    "icons": "node scripts/gen-icons.mjs"
   },
   "devDependencies": {
+    "sharp": "^0.34.5",
     "typescript": "^5.6.3"
   },
   "engines": {
