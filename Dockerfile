@@ -2,17 +2,35 @@
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1 — Build the Rust engine to WebAssembly.
+#
+# We install wasm-pack from its pre-built GitHub release rather than
+# `cargo install`. The cargo-install path tries to compile wasm-pack's
+# transitive deps (which now require Rust edition2024, i.e. ≥1.85) — pulling
+# the static binary sidesteps that toolchain coupling and shaves several
+# minutes off the build.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM rust:1.83-slim AS engine-builder
 
-# wasm-pack pinned to match CI.
-ARG WASM_PACK_VERSION=0.15.0
+ARG WASM_PACK_VERSION=0.13.1
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends pkg-config libssl-dev curl ca-certificates \
- && rm -rf /var/lib/apt/lists/* \
- && cargo install wasm-pack --locked --version "${WASM_PACK_VERSION}" \
- && rustup target add wasm32-unknown-unknown
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev curl ca-certificates xz-utils; \
+    rm -rf /var/lib/apt/lists/*; \
+    rustup target add wasm32-unknown-unknown; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  triple="x86_64-unknown-linux-musl" ;; \
+      aarch64) triple="aarch64-unknown-linux-musl" ;; \
+      *) echo "unsupported arch $arch" >&2; exit 1 ;; \
+    esac; \
+    tarball="wasm-pack-v${WASM_PACK_VERSION}-${triple}.tar.gz"; \
+    url="https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/${tarball}"; \
+    curl -sSfL "$url" -o /tmp/wp.tgz; \
+    tar -xzf /tmp/wp.tgz -C /tmp; \
+    install -m 0755 "/tmp/wasm-pack-v${WASM_PACK_VERSION}-${triple}/wasm-pack" /usr/local/bin/wasm-pack; \
+    rm -rf /tmp/wp.tgz /tmp/wasm-pack-v${WASM_PACK_VERSION}-${triple}; \
+    wasm-pack --version
 
 WORKDIR /build
 
