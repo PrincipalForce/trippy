@@ -1,0 +1,20 @@
+{
+  "name": "trippy-engine",
+  "type": "module",
+  "collaborators": [
+    "trippy contributors"
+  ],
+  "description": "trippy DSP core — sample-accurate audio graph, transport, clip engine.",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "files": [
+    "trippy_engine_bg.wasm",
+    "trippy_engine.js",
+    "trippy_engine.d.ts"
+  ],
+  "main": "trippy_engine.js",
+  "types": "trippy_engine.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

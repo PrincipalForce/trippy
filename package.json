@@ -12,8 +12,8 @@
   "scripts": {
     "dev": "pnpm --filter @trippy/web dev",
     "build": "pnpm --filter @trippy/web build",
-    "build:engine": "wasm-pack build crates/trippy-engine --target web --out-dir ../../apps/web/src/engine/pkg --release",
-    "build:engine:dev": "wasm-pack build crates/trippy-engine --target web --out-dir ../../apps/web/src/engine/pkg --dev",
+    "build:engine": "wasm-pack build crates/trippy-engine --target web --out-dir ../../apps/web/src/engine/pkg --release && node -e \"require('fs').rmSync('apps/web/src/engine/pkg/.gitignore',{force:true})\"",
+    "build:engine:dev": "wasm-pack build crates/trippy-engine --target web --out-dir ../../apps/web/src/engine/pkg --dev && node -e \"require('fs').rmSync('apps/web/src/engine/pkg/.gitignore',{force:true})\"",
     "typecheck": "pnpm -r --if-present run typecheck",
     "test": "pnpm -r --if-present run test",
     "test:rust": "cargo test --workspace",
