@@ -43,6 +43,11 @@ apps/web/public/plugins/*/
 !apps/web/public/plugins/.gitkeep
 !apps/web/public/plugins/index.json
 
+# --- Launchmatic deploy config ---
+# Contains team/project IDs tied to a specific Launchmatic workspace; kept
+# local-only so forks don't accidentally inherit deploy targets.
+launchmatic.json
+
 # --- Cloudflare Workers (M8) ---
 .wrangler/
 infra/workers/*/.wrangler/
