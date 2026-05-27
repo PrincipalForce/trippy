@@ -1,38 +1,187 @@
 // Multi-track timeline with Canvas2D-rendered waveforms and pinch/wheel zoom.
 //
-// The timeline is laid out horizontally (time → x) with stacked track lanes
-// vertically. Pixels-per-frame is the single zoom parameter; pan offset is in
-// frames. Touch gestures: one-finger drag pans, two-finger pinch zooms.
+// Interaction model:
+//   - Touch/pointer on a clip → select it; subsequent drag moves the clip
+//     (horizontally along time, vertically across track lanes).
+//   - Touch/pointer on a clip's left or right edge (within `EDGE_HIT_PX`) →
+//     trim that edge instead of moving. Trim keeps the audio that remains
+//     in-sync by adjusting offsetInSource for the head, only lengthFrames
+//     for the tail.
+//   - Touch/pointer on empty lane background → one-finger pan, two-finger
+//     pinch-zoom. Tapping the ruler seeks.
+//   - Long-press on a clip (500ms with <8px of motion) → fires
+//     `onClipLongPress` so the parent can pop an action menu.
 //
-// Waveform peaks come from `WaveformCache`. Per-frame redraws hit only the
-// chosen pyramid level so cost is O(width).
+// Engine sync is left to the parent — we only emit a single `onClipChange`
+// once the gesture ends. Mid-gesture the clip is rendered against a local
+// `pendingTransform` so audio doesn't get torn down on every pointer move.
 
-import { createEffect, onCleanup, onMount, For } from "solid-js";
+import { createEffect, onCleanup, onMount } from "solid-js";
 import type { ProjectFile, TrackSnapshot, ClipSnapshot, SourceMeta } from "@trippy/format";
 import { chooseLevel, type Waveform } from "../../audio/waveform-cache";
 
+export interface ClipRef {
+  trackId: number;
+  clipId: number;
+}
+
+export interface ClipPatch {
+  startFrame?: number;
+  lengthFrames?: number;
+  offsetInSource?: number;
+  /** Destination trackId if the clip was dragged across lanes. */
+  trackId?: number;
+}
+
 export interface TimelineProps {
   project: ProjectFile;
-  waveforms: Map<number, Waveform>; // sourceId → Waveform
+  waveforms: Map<number, Waveform>;
   positionFrames: number;
-  /** Initial zoom in frames per pixel. */
+  selected?: ClipRef | null;
   initialZoom?: number;
   onSeek?: (frame: number) => void;
+  onSelectClip?: (ref: ClipRef | null) => void;
+  /** Commit a finished move/trim/lane-swap gesture. */
+  onClipChange?: (ref: ClipRef, patch: ClipPatch) => void;
+  /** User held a clip — parent should surface an action menu. `clientX/Y`
+   *  are screen-space anchor coords for positioning a popover. */
+  onClipLongPress?: (ref: ClipRef, clientX: number, clientY: number) => void;
 }
 
 const TRACK_HEIGHT = 80;
 const RULER_HEIGHT = 28;
-const MIN_FPP = 8; // frames per pixel
+const MIN_FPP = 8;
 const MAX_FPP = 100_000;
+const EDGE_HIT_PX = 14; // touch-friendly trim handle
+const LONG_PRESS_MS = 500;
+const LONG_PRESS_SLOP_PX = 8;
+const MIN_CLIP_FRAMES = 64; // refuse to trim a clip below this
+
+type GestureMode =
+  | { kind: "none" }
+  | { kind: "pan"; startX: number; startPan: number }
+  | { kind: "pinch"; startDist: number; startFpp: number; centerFrame: number }
+  | {
+      kind: "move";
+      ref: ClipRef;
+      grabFrameOffset: number; // pointer's frame minus clip.startFrame at grab
+      grabLaneIndex: number;
+      pointerStartX: number;
+      pointerStartY: number;
+      moved: boolean;
+    }
+  | {
+      kind: "trim";
+      ref: ClipRef;
+      edge: "left" | "right";
+      origStart: number;
+      origLength: number;
+      origOffset: number;
+      pointerStartX: number;
+      moved: boolean;
+    };
+
+interface PendingTransform {
+  trackId: number;
+  clipId: number;
+  startFrame: number;
+  lengthFrames: number;
+  offsetInSource: number;
+  laneIndex: number;
+}
 
 export function Timeline(props: TimelineProps) {
   let canvas: HTMLCanvasElement | undefined;
-  let container: HTMLDivElement | undefined;
   let framesPerPixel = props.initialZoom ?? 1024;
   let panFrames = 0;
 
-  let pinchStart: { dist: number; fpp: number; centerFrame: number } | null = null;
-  let dragStart: { x: number; panFrames: number } | null = null;
+  let gesture: GestureMode = { kind: "none" };
+  let pending: PendingTransform | null = null;
+  let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+  const activeTouches = new Map<number, { x: number; y: number }>();
+
+  function frameToX(frame: number): number {
+    return (frame - panFrames) / framesPerPixel;
+  }
+  function xToFrame(x: number): number {
+    return panFrames + x * framesPerPixel;
+  }
+  function yToLane(y: number): number {
+    if (y < RULER_HEIGHT) return -1;
+    return Math.floor((y - RULER_HEIGHT) / TRACK_HEIGHT);
+  }
+
+  // Beat-grid step in frames, matching the visible ruler subdivision.
+  function gridStepFrames(): number {
+    const sr = props.project.transport.sampleRate;
+    const fpb = (60 / props.project.transport.bpm) * sr;
+    let sub = 1;
+    while ((fpb * sub) / framesPerPixel < 24) sub *= 2;
+    return fpb * sub;
+  }
+
+  function snap(frame: number): number {
+    const step = gridStepFrames();
+    if (step <= 0) return Math.max(0, Math.round(frame));
+    return Math.max(0, Math.round(frame / step) * step);
+  }
+
+  // Resolve a clip's rendered geometry, honoring any in-flight pending
+  // transform so dragging shows movement immediately.
+  function effectiveClip(
+    trackId: number,
+    clip: ClipSnapshot,
+  ): { startFrame: number; lengthFrames: number; offsetInSource: number; laneIndex: number } {
+    if (
+      pending &&
+      pending.trackId === trackId &&
+      pending.clipId === clip.id
+    ) {
+      return {
+        startFrame: pending.startFrame,
+        lengthFrames: pending.lengthFrames,
+        offsetInSource: pending.offsetInSource,
+        laneIndex: pending.laneIndex,
+      };
+    }
+    const laneIndex = props.project.tracks.findIndex((t) => t.id === trackId);
+    return {
+      startFrame: clip.startFrame,
+      lengthFrames: clip.lengthFrames,
+      offsetInSource: clip.offsetInSource,
+      laneIndex: Math.max(0, laneIndex),
+    };
+  }
+
+  function hitTestClip(
+    x: number,
+    y: number,
+  ): { ref: ClipRef; clip: ClipSnapshot; edge: "left" | "right" | null } | null {
+    const lane = yToLane(y);
+    if (lane < 0) return null;
+    const frame = xToFrame(x);
+    // Walk all tracks/clips and prefer the lane match, but also accept a
+    // dragged clip whose pending lane is `lane`.
+    for (let ti = 0; ti < props.project.tracks.length; ti++) {
+      const t = props.project.tracks[ti]!;
+      for (const c of t.clips) {
+        const eff = effectiveClip(t.id, c);
+        if (eff.laneIndex !== lane) continue;
+        const start = eff.startFrame;
+        const end = start + eff.lengthFrames;
+        if (frame < start || frame > end) continue;
+        const xStart = frameToX(start);
+        const xEnd = frameToX(end);
+        let edge: "left" | "right" | null = null;
+        if (x - xStart < EDGE_HIT_PX) edge = "left";
+        else if (xEnd - x < EDGE_HIT_PX) edge = "right";
+        return { ref: { trackId: t.id, clipId: c.id }, clip: c, edge };
+      }
+    }
+    return null;
+  }
+
+  // ─── Rendering ────────────────────────────────────────────────────────
 
   function draw() {
     if (!canvas) return;
@@ -52,13 +201,6 @@ export function Timeline(props: TimelineProps) {
     drawPlayhead(ctx, cssW, cssH);
   }
 
-  function frameToX(frame: number): number {
-    return (frame - panFrames) / framesPerPixel;
-  }
-  function xToFrame(x: number): number {
-    return panFrames + x * framesPerPixel;
-  }
-
   function drawRuler(ctx: CanvasRenderingContext2D, w: number, sr: number, bpm: number) {
     ctx.fillStyle = "#14141c";
     ctx.fillRect(0, 0, w, RULER_HEIGHT);
@@ -68,19 +210,18 @@ export function Timeline(props: TimelineProps) {
     ctx.lineTo(w, RULER_HEIGHT - 0.5);
     ctx.stroke();
 
-    // Beat grid: choose the smallest beat subdivision that's at least 24 px wide.
-    const framesPerBeat = (60 / bpm) * sr;
-    let subdivision = 1;
-    while ((framesPerBeat * subdivision) / framesPerPixel < 24) subdivision *= 2;
-    const stepFrames = framesPerBeat * subdivision;
+    const fpb = (60 / bpm) * sr;
+    let sub = 1;
+    while ((fpb * sub) / framesPerPixel < 24) sub *= 2;
+    const stepFrames = fpb * sub;
 
-    const firstBeat = Math.floor(panFrames / stepFrames);
-    const lastBeat = Math.ceil((panFrames + w * framesPerPixel) / stepFrames);
+    const first = Math.floor(panFrames / stepFrames);
+    const last = Math.ceil((panFrames + w * framesPerPixel) / stepFrames);
 
     ctx.font = "11px ui-monospace, SF Mono, Menlo, monospace";
     ctx.fillStyle = "#8a8aa0";
     ctx.textBaseline = "middle";
-    for (let b = firstBeat; b <= lastBeat; b++) {
+    for (let b = first; b <= last; b++) {
       const f = b * stepFrames;
       const x = frameToX(f);
       ctx.strokeStyle = b % 4 === 0 ? "#3a3a55" : "#1e1e2a";
@@ -89,7 +230,7 @@ export function Timeline(props: TimelineProps) {
       ctx.lineTo(x + 0.5, RULER_HEIGHT);
       ctx.stroke();
       if (b % 4 === 0) {
-        const bar = Math.floor(b * subdivision) / 4 + 1;
+        const bar = Math.floor(b * sub) / 4 + 1;
         ctx.fillText(`${bar.toFixed(0)}`, x + 4, RULER_HEIGHT / 2);
       }
     }
@@ -100,24 +241,21 @@ export function Timeline(props: TimelineProps) {
     for (let i = 0; i < tracks.length; i++) {
       const y = RULER_HEIGHT + i * TRACK_HEIGHT;
       if (y >= h) break;
-      // Lane background
       ctx.fillStyle = i % 2 === 0 ? "#0d0d14" : "#101019";
       ctx.fillRect(0, y, w, TRACK_HEIGHT);
-      // Beat grid lines through lane
       drawTrackGrid(ctx, w, y);
-      // Clips
-      for (const clip of tracks[i]!.clips) {
-        drawClip(ctx, w, y, tracks[i]!, clip);
+    }
+    // Render clips in a second pass so a dragged clip lands on the lane
+    // matching its pending laneIndex (which may differ from its track index).
+    for (const t of tracks) {
+      for (const c of t.clips) {
+        drawClip(ctx, w, t, c);
       }
     }
   }
 
   function drawTrackGrid(ctx: CanvasRenderingContext2D, w: number, y: number) {
-    const sr = props.project.transport.sampleRate;
-    const framesPerBeat = (60 / props.project.transport.bpm) * sr;
-    let subdivision = 1;
-    while ((framesPerBeat * subdivision) / framesPerPixel < 24) subdivision *= 2;
-    const stepFrames = framesPerBeat * subdivision;
+    const stepFrames = gridStepFrames();
     const first = Math.floor(panFrames / stepFrames);
     const last = Math.ceil((panFrames + w * framesPerPixel) / stepFrames);
     ctx.strokeStyle = "#15151f";
@@ -133,12 +271,13 @@ export function Timeline(props: TimelineProps) {
   function drawClip(
     ctx: CanvasRenderingContext2D,
     canvasW: number,
-    y: number,
-    _track: TrackSnapshot,
+    track: TrackSnapshot,
     clip: ClipSnapshot,
   ) {
-    const x1 = frameToX(clip.startFrame);
-    const x2 = frameToX(clip.startFrame + clip.lengthFrames);
+    const eff = effectiveClip(track.id, clip);
+    const y = RULER_HEIGHT + eff.laneIndex * TRACK_HEIGHT;
+    const x1 = frameToX(eff.startFrame);
+    const x2 = frameToX(eff.startFrame + eff.lengthFrames);
     const left = Math.max(-1, x1);
     const right = Math.min(canvasW + 1, x2);
     if (right <= left) return;
@@ -146,23 +285,32 @@ export function Timeline(props: TimelineProps) {
     const top = y + 2;
     const h = TRACK_HEIGHT - 4;
 
+    const isSelected =
+      props.selected?.trackId === track.id && props.selected?.clipId === clip.id;
+
     ctx.save();
-    ctx.fillStyle = "#1b1633";
-    ctx.strokeStyle = "#7c5cff";
-    ctx.lineWidth = 1;
+    ctx.fillStyle = isSelected ? "#2a205a" : "#1b1633";
+    ctx.strokeStyle = isSelected ? "#bdb1ff" : "#7c5cff";
+    ctx.lineWidth = isSelected ? 2 : 1;
     roundRect(ctx, left, top, w, h, 6);
     ctx.fill();
     ctx.stroke();
 
-    // Clip caption
     if (clip.label) {
       ctx.fillStyle = "#bdb1ff";
       ctx.font = "11px system-ui";
       ctx.textBaseline = "top";
-      ctx.fillText(clip.label, left + 6, top + 4);
+      const labelW = w - 12;
+      if (labelW > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(left + 4, top + 2, labelW, 16);
+        ctx.clip();
+        ctx.fillText(clip.label, left + 6, top + 4);
+        ctx.restore();
+      }
     }
 
-    // Waveform
     const wf = props.waveforms.get(clip.sourceId);
     if (wf && wf.levels[0]) {
       const channelLevels = wf.levels[0]!;
@@ -172,13 +320,13 @@ export function Timeline(props: TimelineProps) {
       const yMid = top + h / 2;
       const yScale = (h / 2) * 0.92;
 
-      ctx.strokeStyle = "#7c5cff";
+      ctx.strokeStyle = isSelected ? "#d8ccff" : "#7c5cff";
       ctx.beginPath();
       const fpp = framesPerPixel;
       const widthPx = right - left;
       for (let px = 0; px < widthPx; px++) {
         const projFrame = panFrames + (left + px) * fpp;
-        const clipRel = projFrame - clip.startFrame + clip.offsetInSource;
+        const clipRel = projFrame - eff.startFrame + eff.offsetInSource;
         if (clipRel < 0) continue;
         const b = Math.floor(clipRel / bucketSize);
         if (b * 2 + 1 >= peaks.length) break;
@@ -190,6 +338,13 @@ export function Timeline(props: TimelineProps) {
         ctx.lineTo(left + px + 0.5, yBot);
       }
       ctx.stroke();
+    }
+
+    // Trim handles for the selected clip — subtle inset bars.
+    if (isSelected && w > EDGE_HIT_PX * 2) {
+      ctx.fillStyle = "#bdb1ff";
+      ctx.fillRect(left + 2, top + h / 2 - 10, 3, 20);
+      ctx.fillRect(right - 5, top + h / 2 - 10, 3, 20);
     }
     ctx.restore();
   }
@@ -230,7 +385,15 @@ export function Timeline(props: TimelineProps) {
     return Math.max(MIN_FPP, Math.min(MAX_FPP, fpp));
   }
 
-  // Wheel: zoom (with ctrl/cmd) or horizontal pan.
+  // ─── Pointer / gesture handling ──────────────────────────────────────
+
+  function cancelLongPress() {
+    if (longPressTimer) {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+    }
+  }
+
   function onWheel(e: WheelEvent) {
     e.preventDefault();
     const rect = canvas!.getBoundingClientRect();
@@ -247,81 +410,237 @@ export function Timeline(props: TimelineProps) {
     draw();
   }
 
-  // Touch handlers — pinch + pan.
-  const activeTouches = new Map<number, { x: number; y: number }>();
-
   function onPointerDown(e: PointerEvent) {
     canvas!.setPointerCapture(e.pointerId);
     activeTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (activeTouches.size === 1) {
-      dragStart = { x: e.clientX, panFrames };
-    } else if (activeTouches.size === 2) {
+
+    // Two-finger gesture upgrades to pinch regardless of what we were doing.
+    if (activeTouches.size === 2) {
+      cancelLongPress();
       const [a, b] = [...activeTouches.values()];
-      const dx = a!.x - b!.x;
-      const dy = a!.y - b!.y;
-      const dist = Math.hypot(dx, dy);
+      const dist = Math.hypot(a!.x - b!.x, a!.y - b!.y);
       const centerX = (a!.x + b!.x) / 2;
       const rect = canvas!.getBoundingClientRect();
-      const centerFrame = xToFrame(centerX - rect.left);
-      pinchStart = { dist, fpp: framesPerPixel, centerFrame };
-      dragStart = null;
+      gesture = {
+        kind: "pinch",
+        startDist: dist,
+        startFpp: framesPerPixel,
+        centerFrame: xToFrame(centerX - rect.left),
+      };
+      pending = null;
+      return;
     }
+
+    const rect = canvas!.getBoundingClientRect();
+    const localX = e.clientX - rect.left;
+    const localY = e.clientY - rect.top;
+
+    // Tap in the ruler → seek and stop. Don't start a drag.
+    if (localY < RULER_HEIGHT) {
+      props.onSeek?.(Math.max(0, Math.floor(xToFrame(localX))));
+      gesture = { kind: "none" };
+      return;
+    }
+
+    const hit = hitTestClip(localX, localY);
+    if (hit) {
+      props.onSelectClip?.(hit.ref);
+      const track = props.project.tracks.find((t) => t.id === hit.ref.trackId)!;
+      const eff = effectiveClip(track.id, hit.clip);
+      if (hit.edge) {
+        gesture = {
+          kind: "trim",
+          ref: hit.ref,
+          edge: hit.edge,
+          origStart: eff.startFrame,
+          origLength: eff.lengthFrames,
+          origOffset: eff.offsetInSource,
+          pointerStartX: e.clientX,
+          moved: false,
+        };
+        pending = {
+          trackId: hit.ref.trackId,
+          clipId: hit.ref.clipId,
+          startFrame: eff.startFrame,
+          lengthFrames: eff.lengthFrames,
+          offsetInSource: eff.offsetInSource,
+          laneIndex: eff.laneIndex,
+        };
+      } else {
+        const pointerFrame = xToFrame(localX);
+        gesture = {
+          kind: "move",
+          ref: hit.ref,
+          grabFrameOffset: pointerFrame - eff.startFrame,
+          grabLaneIndex: eff.laneIndex,
+          pointerStartX: e.clientX,
+          pointerStartY: e.clientY,
+          moved: false,
+        };
+        pending = {
+          trackId: hit.ref.trackId,
+          clipId: hit.ref.clipId,
+          startFrame: eff.startFrame,
+          lengthFrames: eff.lengthFrames,
+          offsetInSource: eff.offsetInSource,
+          laneIndex: eff.laneIndex,
+        };
+        // Arm long-press timer; it fires only if the pointer hasn't moved.
+        const startX = e.clientX;
+        const startY = e.clientY;
+        const ref = hit.ref;
+        longPressTimer = setTimeout(() => {
+          longPressTimer = null;
+          props.onClipLongPress?.(ref, startX, startY);
+        }, LONG_PRESS_MS);
+      }
+      draw();
+      return;
+    }
+
+    // Empty lane → pan, and deselect.
+    props.onSelectClip?.(null);
+    gesture = { kind: "pan", startX: e.clientX, startPan: panFrames };
   }
 
   function onPointerMove(e: PointerEvent) {
     if (!activeTouches.has(e.pointerId)) return;
     activeTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (activeTouches.size === 2 && pinchStart) {
+
+    if (gesture.kind === "pinch" && activeTouches.size >= 2) {
       const [a, b] = [...activeTouches.values()];
       const dist = Math.hypot(a!.x - b!.x, a!.y - b!.y);
-      const ratio = pinchStart.dist / Math.max(1, dist);
-      framesPerPixel = clampZoom(pinchStart.fpp * ratio);
+      const ratio = gesture.startDist / Math.max(1, dist);
+      framesPerPixel = clampZoom(gesture.startFpp * ratio);
       const centerX = (a!.x + b!.x) / 2;
       const rect = canvas!.getBoundingClientRect();
-      panFrames = pinchStart.centerFrame - (centerX - rect.left) * framesPerPixel;
+      panFrames = gesture.centerFrame - (centerX - rect.left) * framesPerPixel;
       if (panFrames < 0) panFrames = 0;
       draw();
-    } else if (activeTouches.size === 1 && dragStart) {
-      const dx = e.clientX - dragStart.x;
-      panFrames = Math.max(0, dragStart.panFrames - dx * framesPerPixel);
+      return;
+    }
+
+    if (gesture.kind === "pan") {
+      const dx = e.clientX - gesture.startX;
+      panFrames = Math.max(0, gesture.startPan - dx * framesPerPixel);
+      draw();
+      return;
+    }
+
+    if (gesture.kind === "move" && pending) {
+      const dx = e.clientX - gesture.pointerStartX;
+      const dy = e.clientY - gesture.pointerStartY;
+      if (Math.hypot(dx, dy) > LONG_PRESS_SLOP_PX) cancelLongPress();
+      const rect = canvas!.getBoundingClientRect();
+      const localX = e.clientX - rect.left;
+      const localY = e.clientY - rect.top;
+      const pointerFrame = xToFrame(localX);
+      let newStart = snap(pointerFrame - gesture.grabFrameOffset);
+      if (newStart < 0) newStart = 0;
+      const newLane = Math.max(
+        0,
+        Math.min(props.project.tracks.length - 1, yToLane(localY)),
+      );
+      pending.startFrame = newStart;
+      pending.laneIndex = newLane;
+      gesture.moved = gesture.moved || Math.hypot(dx, dy) > 2;
+      draw();
+      return;
+    }
+
+    if (gesture.kind === "trim" && pending) {
+      const dx = e.clientX - gesture.pointerStartX;
+      const dFrames = dx * framesPerPixel;
+      if (gesture.edge === "left") {
+        // Move startFrame and offsetInSource together so audio keeps
+        // sample-accurate alignment under the trim point.
+        let newStart = snap(gesture.origStart + dFrames);
+        const maxStart = gesture.origStart + gesture.origLength - MIN_CLIP_FRAMES;
+        if (newStart > maxStart) newStart = maxStart;
+        if (newStart < 0) newStart = 0;
+        const delta = newStart - gesture.origStart;
+        let newOffset = gesture.origOffset + delta;
+        if (newOffset < 0) newOffset = 0;
+        const newLength = gesture.origLength - delta;
+        pending.startFrame = newStart;
+        pending.offsetInSource = newOffset;
+        pending.lengthFrames = Math.max(MIN_CLIP_FRAMES, newLength);
+      } else {
+        const newEnd = snap(gesture.origStart + gesture.origLength + dFrames);
+        const minEnd = gesture.origStart + MIN_CLIP_FRAMES;
+        pending.lengthFrames = Math.max(MIN_CLIP_FRAMES, newEnd - gesture.origStart);
+        if (pending.lengthFrames < MIN_CLIP_FRAMES) pending.lengthFrames = MIN_CLIP_FRAMES;
+        if (newEnd < minEnd) pending.lengthFrames = MIN_CLIP_FRAMES;
+      }
+      gesture.moved = gesture.moved || Math.abs(dx) > 2;
       draw();
     }
+  }
+
+  function commitPending() {
+    if (!pending) return;
+    const ref: ClipRef = { trackId: pending.trackId, clipId: pending.clipId };
+    const lane = pending.laneIndex;
+    const destTrackId = props.project.tracks[lane]?.id ?? pending.trackId;
+    const patch: ClipPatch = {
+      startFrame: pending.startFrame,
+      lengthFrames: pending.lengthFrames,
+      offsetInSource: pending.offsetInSource,
+    };
+    if (destTrackId !== pending.trackId) patch.trackId = destTrackId;
+    props.onClipChange?.(ref, patch);
+    pending = null;
   }
 
   function onPointerUp(e: PointerEvent) {
     activeTouches.delete(e.pointerId);
-    if (activeTouches.size < 2) pinchStart = null;
-    if (activeTouches.size === 0) dragStart = null;
-  }
 
-  function onClick(e: MouseEvent) {
-    // Only treat a click (no drag movement) as a seek.
-    if (!props.onSeek) return;
-    const rect = canvas!.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    if (e.clientY - rect.top < RULER_HEIGHT) {
-      props.onSeek(Math.max(0, Math.floor(xToFrame(x))));
+    if (gesture.kind === "move" || gesture.kind === "trim") {
+      cancelLongPress();
+      if (gesture.moved) commitPending();
+      else pending = null; // tap-without-drag — no commit, just selection.
+      gesture = { kind: "none" };
+      draw();
+      return;
+    }
+
+    if (gesture.kind === "pinch" && activeTouches.size < 2) {
+      gesture = { kind: "none" };
+    } else if (gesture.kind === "pan" && activeTouches.size === 0) {
+      gesture = { kind: "none" };
     }
   }
+
+  function onPointerCancel(e: PointerEvent) {
+    activeTouches.delete(e.pointerId);
+    cancelLongPress();
+    pending = null;
+    gesture = { kind: "none" };
+    draw();
+  }
+
+  // ─── Lifecycle ───────────────────────────────────────────────────────
 
   onMount(() => {
     draw();
     const ro = new ResizeObserver(() => draw());
     if (canvas) ro.observe(canvas);
-    onCleanup(() => ro.disconnect());
+    onCleanup(() => {
+      ro.disconnect();
+      cancelLongPress();
+    });
   });
 
-  // Redraw on prop changes.
   createEffect(() => {
     void props.project;
     void props.positionFrames;
     void props.waveforms;
+    void props.selected;
     draw();
   });
 
   return (
     <div
-      ref={(el) => (container = el)}
       style={{
         position: "relative",
         width: "100%",
@@ -336,17 +655,12 @@ export function Timeline(props: TimelineProps) {
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-        onClick={onClick}
-        style={{ width: "100%", height: "100%", display: "block", cursor: "crosshair" }}
+        onPointerCancel={onPointerCancel}
+        style={{ width: "100%", height: "100%", display: "block", cursor: "default" }}
       />
     </div>
   );
 }
 
-// Re-export for callers that build waveforms ad-hoc.
 export type { Waveform } from "../../audio/waveform-cache";
-
-// Quiet down unused-variable noise from the helper that callers may want
-// later (e.g. for source overlays).
 export type _UnusedRef = SourceMeta;

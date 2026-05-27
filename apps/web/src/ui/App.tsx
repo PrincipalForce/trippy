@@ -4,7 +4,7 @@ import { decodeAudio } from "../audio/decode";
 import { encodeWavPcm16 } from "../audio/wav-encode";
 import { buildWaveform, type Waveform } from "../audio/waveform-cache";
 import { createProjectStore } from "../project/store";
-import { Timeline } from "./timeline/Timeline";
+import { Timeline, type ClipRef, type ClipPatch } from "./timeline/Timeline";
 import { AiPanel } from "./ai/AiPanel";
 import { RecordButton } from "./RecordButton";
 import { opfsAvailable, saveProject, loadProject, listProjects } from "../project/opfs";
@@ -24,6 +24,14 @@ export function App() {
   // engine track id ↔ project track id mapping
   const engineTrackIds = new Map<number, number>();
   const engineSourceIds = new Map<number, number>();
+  // projClipId → engineClipId. Updated on every move/trim since the engine
+  // re-adds the clip (no in-place update API), assigning a new id each time.
+  const engineClipIds = new Map<number, number>();
+
+  const [selectedClip, setSelectedClip] = createSignal<ClipRef | null>(null);
+  const [longPressMenu, setLongPressMenu] = createSignal<
+    { ref: ClipRef; x: number; y: number } | null
+  >(null);
 
   const controller = getController();
 
@@ -101,13 +109,14 @@ export function App() {
         label: file.name,
       });
       if (clipId != null) {
-        await controller.addClip({
+        const engineClipId = await controller.addClip({
           trackId: engineTrackId,
           sourceId: engineSrc.sourceId,
           startFrame: 0,
           lengthFrames: engineSrc.frameCount,
           offsetInSource: 0,
         });
+        engineClipIds.set(clipId, engineClipId);
       }
 
       // 5) Auto-set loop on first load to the new clip
@@ -151,6 +160,8 @@ export function App() {
       sourceBytes.clear();
       engineSourceIds.clear();
       engineTrackIds.clear();
+      engineClipIds.clear();
+      setSelectedClip(null);
       const newWf = new Map<number, Waveform>();
       // Re-push all sources to engine + rebuild waveforms
       for (const src of proj.sources) {
@@ -174,13 +185,14 @@ export function App() {
         for (const c of t.clips) {
           const engineSid = engineSourceIds.get(c.sourceId);
           if (engineSid == null) continue;
-          await controller.addClip({
+          const eid = await controller.addClip({
             trackId: engineTid,
             sourceId: engineSid,
             startFrame: c.startFrame,
             lengthFrames: c.lengthFrames,
             offsetInSource: c.offsetInSource,
           });
+          engineClipIds.set(c.id, eid);
         }
       }
       if (proj.transport.loop) {
@@ -205,6 +217,116 @@ export function App() {
   }
 
   const bpm = createMemo(() => project.state.project.transport.bpm);
+
+  // Re-add the engine-side clip after a project-side mutation. The engine has
+  // no in-place update, so we tear down and recreate; the worker preserves
+  // monotonic clip ids so we map the fresh id back into engineClipIds.
+  async function resyncClipToEngine(trackId: number, clipId: number) {
+    const oldEngineClip = engineClipIds.get(clipId);
+    const oldEngineTrack = engineTrackIds.get(trackId);
+    // The project model already reflects the post-edit state — find the clip
+    // (it may have moved to a different track).
+    let projTrack: { id: number } | undefined;
+    let projClip:
+      | { id: number; sourceId: number; startFrame: number; lengthFrames: number; offsetInSource: number }
+      | undefined;
+    for (const t of project.state.project.tracks) {
+      const c = t.clips.find((cl) => cl.id === clipId);
+      if (c) {
+        projTrack = t;
+        projClip = c;
+        break;
+      }
+    }
+    if (!projTrack || !projClip) return;
+    const newEngineTrack = engineTrackIds.get(projTrack.id);
+    if (newEngineTrack == null) return;
+    const engineSrc = engineSourceIds.get(projClip.sourceId);
+    if (engineSrc == null) return;
+
+    if (oldEngineTrack != null && oldEngineClip != null) {
+      controller.removeClip(oldEngineTrack, oldEngineClip);
+    }
+    const newId = await controller.addClip({
+      trackId: newEngineTrack,
+      sourceId: engineSrc,
+      startFrame: projClip.startFrame,
+      lengthFrames: projClip.lengthFrames,
+      offsetInSource: projClip.offsetInSource,
+    });
+    engineClipIds.set(clipId, newId);
+  }
+
+  function handleClipChange(ref: ClipRef, patch: ClipPatch) {
+    const movingTrack = patch.trackId != null && patch.trackId !== ref.trackId;
+    if (movingTrack) {
+      // Find the clip on its current track, copy it onto the destination, then
+      // remove from the original. Reuses the same clipId for engineClipIds.
+      const fromTrack = project.state.project.tracks.find((t) => t.id === ref.trackId);
+      const clip = fromTrack?.clips.find((c) => c.id === ref.clipId);
+      if (!clip) return;
+      project.commit((p) => {
+        const ft = p.tracks.find((t) => t.id === ref.trackId);
+        const tt = p.tracks.find((t) => t.id === patch.trackId);
+        if (!ft || !tt) return;
+        const idx = ft.clips.findIndex((c) => c.id === ref.clipId);
+        if (idx < 0) return;
+        const [moved] = ft.clips.splice(idx, 1);
+        if (!moved) return;
+        if (patch.startFrame != null) moved.startFrame = patch.startFrame;
+        if (patch.lengthFrames != null) moved.lengthFrames = patch.lengthFrames;
+        if (patch.offsetInSource != null) moved.offsetInSource = patch.offsetInSource;
+        tt.clips.push(moved);
+      });
+      void resyncClipToEngine(patch.trackId!, ref.clipId);
+    } else {
+      project.updateClip(ref.trackId, ref.clipId, {
+        ...(patch.startFrame != null && { startFrame: patch.startFrame }),
+        ...(patch.lengthFrames != null && { lengthFrames: patch.lengthFrames }),
+        ...(patch.offsetInSource != null && { offsetInSource: patch.offsetInSource }),
+      });
+      void resyncClipToEngine(ref.trackId, ref.clipId);
+    }
+  }
+
+  function deleteClip(ref: ClipRef) {
+    const eTrack = engineTrackIds.get(ref.trackId);
+    const eClip = engineClipIds.get(ref.clipId);
+    if (eTrack != null && eClip != null) controller.removeClip(eTrack, eClip);
+    engineClipIds.delete(ref.clipId);
+    project.removeClip(ref.trackId, ref.clipId);
+    setSelectedClip(null);
+    setLongPressMenu(null);
+  }
+
+  async function duplicateClip(ref: ClipRef) {
+    const track = project.state.project.tracks.find((t) => t.id === ref.trackId);
+    const clip = track?.clips.find((c) => c.id === ref.clipId);
+    if (!track || !clip) return;
+    const newProjClipId = project.addClip(ref.trackId, {
+      sourceId: clip.sourceId,
+      startFrame: clip.startFrame + clip.lengthFrames,
+      lengthFrames: clip.lengthFrames,
+      offsetInSource: clip.offsetInSource,
+      gain: clip.gain,
+      label: clip.label,
+    });
+    if (newProjClipId == null) return;
+    const eTrack = engineTrackIds.get(ref.trackId);
+    const eSrc = engineSourceIds.get(clip.sourceId);
+    if (eTrack != null && eSrc != null) {
+      const eid = await controller.addClip({
+        trackId: eTrack,
+        sourceId: eSrc,
+        startFrame: clip.startFrame + clip.lengthFrames,
+        lengthFrames: clip.lengthFrames,
+        offsetInSource: clip.offsetInSource,
+      });
+      engineClipIds.set(newProjClipId, eid);
+    }
+    setSelectedClip({ trackId: ref.trackId, clipId: newProjClipId });
+    setLongPressMenu(null);
+  }
 
   return (
     <main
@@ -325,8 +447,82 @@ export function App() {
           project={project.state.project}
           waveforms={waveforms()}
           positionFrames={position()}
+          selected={selectedClip()}
           onSeek={(f) => controller.setPosition(f)}
+          onSelectClip={setSelectedClip}
+          onClipChange={handleClipChange}
+          onClipLongPress={(ref, x, y) => setLongPressMenu({ ref, x, y })}
         />
+        <Show when={selectedClip()}>
+          {(sel) => (
+            <div
+              style={{
+                position: "sticky",
+                bottom: 0,
+                display: "flex",
+                gap: "0.4rem",
+                padding: "0.5rem 0.9rem",
+                background: "var(--bg-elevated)",
+                "border-top": "1px solid var(--grid)",
+                "z-index": 5,
+              }}
+            >
+              <span style={{ color: "var(--fg-dim)", "align-self": "center", "font-size": "0.85rem" }}>
+                clip selected
+              </span>
+              <button type="button" onClick={() => duplicateClip(sel())}>⎘ Duplicate</button>
+              <button
+                type="button"
+                onClick={() => deleteClip(sel())}
+                style={{ "border-color": "#ff4d6d", color: "#ffb8c5" }}
+              >
+                ✕ Delete
+              </button>
+              <button type="button" onClick={() => setSelectedClip(null)}>Done</button>
+            </div>
+          )}
+        </Show>
+        <Show when={longPressMenu()}>
+          {(menu) => (
+            <div
+              onClick={() => setLongPressMenu(null)}
+              style={{
+                position: "fixed",
+                inset: 0,
+                "z-index": 50,
+                background: "rgba(0,0,0,0.25)",
+              }}
+            >
+              <div
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  position: "absolute",
+                  left: `${Math.min(window.innerWidth - 180, menu().x)}px`,
+                  top: `${Math.min(window.innerHeight - 140, menu().y)}px`,
+                  background: "var(--bg-elevated)",
+                  border: "1px solid var(--grid)",
+                  "border-radius": "8px",
+                  padding: "0.4rem",
+                  display: "flex",
+                  "flex-direction": "column",
+                  gap: "0.25rem",
+                  "min-width": "160px",
+                  "box-shadow": "0 6px 20px rgba(0,0,0,0.5)",
+                }}
+              >
+                <button type="button" onClick={() => duplicateClip(menu().ref)}>⎘ Duplicate</button>
+                <button
+                  type="button"
+                  onClick={() => deleteClip(menu().ref)}
+                  style={{ "border-color": "#ff4d6d", color: "#ffb8c5" }}
+                >
+                  ✕ Delete
+                </button>
+                <button type="button" onClick={() => setLongPressMenu(null)}>Cancel</button>
+              </div>
+            </div>
+          )}
+        </Show>
       </section>
 
       {/* Mixer strip */}

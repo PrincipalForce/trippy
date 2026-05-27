@@ -165,6 +165,14 @@ export class AudioController {
     return ev.clipId;
   }
 
+  removeClip(trackId: number, clipId: number) {
+    this.worker.postMessage({ type: "removeClip", trackId, clipId } satisfies EngineCommand);
+  }
+
+  removeTrack(trackId: number) {
+    this.worker.postMessage({ type: "removeTrack", trackId } satisfies EngineCommand);
+  }
+
   play() {
     this.worker.postMessage({ type: "play" } satisfies EngineCommand);
   }
