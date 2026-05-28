@@ -7,6 +7,8 @@ import { createProjectStore } from "../project/store";
 import { Timeline, type ClipRef, type ClipPatch } from "./timeline/Timeline";
 import { AiPanel } from "./ai/AiPanel";
 import { RecordButton } from "./RecordButton";
+import { ModeBar, type EditMode } from "./ModeBar";
+import { Inspector } from "./Inspector";
 import { opfsAvailable, saveProject, loadProject, listProjects } from "../project/opfs";
 
 export function App() {
@@ -29,9 +31,27 @@ export function App() {
   const engineClipIds = new Map<number, number>();
 
   const [selectedClip, setSelectedClip] = createSignal<ClipRef | null>(null);
+  const [selectedTrack, setSelectedTrack] = createSignal<number | null>(null);
+  const [mode, setMode] = createSignal<EditMode>("move");
   const [longPressMenu, setLongPressMenu] = createSignal<
     { ref: ClipRef; x: number; y: number } | null
   >(null);
+
+  // Resolve the currently-selected clip into concrete track + clip snapshots
+  // for the Inspector. Returns null if nothing matches.
+  const selectedClipDetail = createMemo(() => {
+    const sel = selectedClip();
+    if (!sel) return null;
+    const t = project.state.project.tracks.find((tr) => tr.id === sel.trackId);
+    const c = t?.clips.find((cl) => cl.id === sel.clipId);
+    if (!t || !c) return null;
+    return { track: t, clip: c };
+  });
+  const selectedTrackSnap = createMemo(() => {
+    const id = selectedTrack();
+    if (id == null) return null;
+    return project.state.project.tracks.find((t) => t.id === id) ?? null;
+  });
 
   const controller = getController();
 
@@ -299,6 +319,95 @@ export function App() {
     setLongPressMenu(null);
   }
 
+  // Cut a clip into two at `splitFrame` (project time). Left half retains
+  // the original projClipId & engine clip; the right half is a fresh clip
+  // starting at splitFrame with an offsetInSource that keeps audio aligned.
+  async function splitClipAt(ref: ClipRef, splitFrame: number) {
+    const track = project.state.project.tracks.find((t) => t.id === ref.trackId);
+    const clip = track?.clips.find((c) => c.id === ref.clipId);
+    if (!track || !clip) return;
+    const clipEnd = clip.startFrame + clip.lengthFrames;
+    if (splitFrame <= clip.startFrame + 64 || splitFrame >= clipEnd - 64) return;
+
+    const leftLength = splitFrame - clip.startFrame;
+    const rightOffset = clip.offsetInSource + leftLength;
+    const rightLength = clip.lengthFrames - leftLength;
+
+    // 1) Shorten the left (existing) clip in the project model & engine.
+    project.updateClip(ref.trackId, ref.clipId, { lengthFrames: leftLength });
+    await resyncClipToEngine(ref.trackId, ref.clipId);
+
+    // 2) Create the right-half clip.
+    const newProjClipId = project.addClip(ref.trackId, {
+      sourceId: clip.sourceId,
+      startFrame: splitFrame,
+      lengthFrames: rightLength,
+      offsetInSource: rightOffset,
+      gain: clip.gain,
+      label: clip.label,
+    });
+    if (newProjClipId == null) return;
+    const eTrack = engineTrackIds.get(ref.trackId);
+    const eSrc = engineSourceIds.get(clip.sourceId);
+    if (eTrack != null && eSrc != null) {
+      const eid = await controller.addClip({
+        trackId: eTrack,
+        sourceId: eSrc,
+        startFrame: splitFrame,
+        lengthFrames: rightLength,
+        offsetInSource: rightOffset,
+      });
+      engineClipIds.set(newProjClipId, eid);
+    }
+  }
+
+  function splitSelectedAtPlayhead() {
+    const sel = selectedClip();
+    if (!sel) return;
+    void splitClipAt(sel, position());
+  }
+
+  function setClipGain(ref: ClipRef, gain: number) {
+    project.updateClip(ref.trackId, ref.clipId, { gain });
+    // Note: engine doesn't yet honor per-clip gain; this is project metadata
+    // until the engine grows a clip-gain field. The slider still updates the
+    // saved value so it lights up correctly when the engine catches up.
+  }
+
+  function renameClip(ref: ClipRef, label: string) {
+    project.updateClip(ref.trackId, ref.clipId, { label });
+  }
+
+  function addEmptyTrack() {
+    const projTrackId = project.addTrack(`track ${project.state.project.tracks.length + 1}`);
+    void (async () => {
+      const eid = await controller.addTrack();
+      engineTrackIds.set(projTrackId, eid);
+    })();
+    setSelectedTrack(projTrackId);
+    setSelectedClip(null);
+  }
+
+  function renameTrack(trackId: number, name: string) {
+    project.updateTrack(trackId, { name });
+  }
+
+  function colorTrack(trackId: number, color: string) {
+    project.updateTrack(trackId, { color });
+  }
+
+  function deleteTrack(trackId: number) {
+    const eTrack = engineTrackIds.get(trackId);
+    const track = project.state.project.tracks.find((t) => t.id === trackId);
+    // Drop engine clip-id mappings for any clip on this track first.
+    if (track) for (const c of track.clips) engineClipIds.delete(c.id);
+    if (eTrack != null) controller.removeTrack(eTrack);
+    engineTrackIds.delete(trackId);
+    project.removeTrack(trackId);
+    setSelectedTrack(null);
+    setSelectedClip(null);
+  }
+
   async function duplicateClip(ref: ClipRef) {
     const track = project.state.project.tracks.find((t) => t.id === ref.trackId);
     const clip = track?.clips.find((c) => c.id === ref.clipId);
@@ -402,6 +511,9 @@ export function App() {
         </label>
         <FilePicker onFile={loadFile} disabled={busy()} />
         <RecordButton onRecording={loadFile} onError={setError} disabled={busy()} />
+        <button type="button" onClick={addEmptyTrack} title="Add a new empty track">
+          + track
+        </button>
         <Show when={opfsAvailable()}>
           <button onClick={save} disabled={busy()} title="Save to browser storage">
             ↓ Save
@@ -435,6 +547,8 @@ export function App() {
         </Show>
       </header>
 
+      <ModeBar mode={mode()} onChange={setMode} />
+
       {/* Timeline */}
       <section
         style={{
@@ -448,40 +562,19 @@ export function App() {
           waveforms={waveforms()}
           positionFrames={position()}
           selected={selectedClip()}
+          selectedTrack={selectedTrack()}
+          mode={mode()}
           onSeek={(f) => controller.setPosition(f)}
-          onSelectClip={setSelectedClip}
+          onSelectClip={(ref) => {
+            setSelectedClip(ref);
+            if (ref) setSelectedTrack(ref.trackId);
+          }}
+          onSelectTrack={setSelectedTrack}
           onClipChange={handleClipChange}
           onClipLongPress={(ref, x, y) => setLongPressMenu({ ref, x, y })}
+          onClipSlice={(ref, frame) => void splitClipAt(ref, frame)}
+          onClipErase={(ref) => deleteClip(ref)}
         />
-        <Show when={selectedClip()}>
-          {(sel) => (
-            <div
-              style={{
-                position: "sticky",
-                bottom: 0,
-                display: "flex",
-                gap: "0.4rem",
-                padding: "0.5rem 0.9rem",
-                background: "var(--bg-elevated)",
-                "border-top": "1px solid var(--grid)",
-                "z-index": 5,
-              }}
-            >
-              <span style={{ color: "var(--fg-dim)", "align-self": "center", "font-size": "0.85rem" }}>
-                clip selected
-              </span>
-              <button type="button" onClick={() => duplicateClip(sel())}>⎘ Duplicate</button>
-              <button
-                type="button"
-                onClick={() => deleteClip(sel())}
-                style={{ "border-color": "#ff4d6d", color: "#ffb8c5" }}
-              >
-                ✕ Delete
-              </button>
-              <button type="button" onClick={() => setSelectedClip(null)}>Done</button>
-            </div>
-          )}
-        </Show>
         <Show when={longPressMenu()}>
           {(menu) => (
             <div
@@ -570,6 +663,45 @@ export function App() {
           </For>
         </section>
       </Show>
+
+      <Inspector
+        selectedClip={selectedClipDetail()}
+        selectedTrack={selectedTrackSnap()}
+        sampleRate={project.state.project.transport.sampleRate}
+        onClipGain={(g) => {
+          const s = selectedClip();
+          if (s) setClipGain(s, g);
+        }}
+        onClipDuplicate={() => {
+          const s = selectedClip();
+          if (s) void duplicateClip(s);
+        }}
+        onClipDelete={() => {
+          const s = selectedClip();
+          if (s) deleteClip(s);
+        }}
+        onClipSplitAtPlayhead={splitSelectedAtPlayhead}
+        onClipRename={(label) => {
+          const s = selectedClip();
+          if (s) renameClip(s, label);
+        }}
+        onTrackRename={(name) => {
+          const id = selectedTrack();
+          if (id != null) renameTrack(id, name);
+        }}
+        onTrackColor={(color) => {
+          const id = selectedTrack();
+          if (id != null) colorTrack(id, color);
+        }}
+        onTrackDelete={() => {
+          const id = selectedTrack();
+          if (id != null) deleteTrack(id);
+        }}
+        onClose={() => {
+          setSelectedClip(null);
+          setSelectedTrack(null);
+        }}
+      />
 
       <AiPanel />
 

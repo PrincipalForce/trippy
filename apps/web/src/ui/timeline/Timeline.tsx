@@ -33,19 +33,28 @@ export interface ClipPatch {
   trackId?: number;
 }
 
+export type TimelineMode = "move" | "slice" | "erase";
+
 export interface TimelineProps {
   project: ProjectFile;
   waveforms: Map<number, Waveform>;
   positionFrames: number;
   selected?: ClipRef | null;
+  selectedTrack?: number | null;
+  mode?: TimelineMode;
   initialZoom?: number;
   onSeek?: (frame: number) => void;
   onSelectClip?: (ref: ClipRef | null) => void;
+  onSelectTrack?: (trackId: number | null) => void;
   /** Commit a finished move/trim/lane-swap gesture. */
   onClipChange?: (ref: ClipRef, patch: ClipPatch) => void;
   /** User held a clip — parent should surface an action menu. `clientX/Y`
    *  are screen-space anchor coords for positioning a popover. */
   onClipLongPress?: (ref: ClipRef, clientX: number, clientY: number) => void;
+  /** Slice-mode hit: split the clip at the given project-frame. */
+  onClipSlice?: (ref: ClipRef, frame: number) => void;
+  /** Erase-mode hit: delete the clip. */
+  onClipErase?: (ref: ClipRef) => void;
 }
 
 const TRACK_HEIGHT = 80;
@@ -241,7 +250,12 @@ export function Timeline(props: TimelineProps) {
     for (let i = 0; i < tracks.length; i++) {
       const y = RULER_HEIGHT + i * TRACK_HEIGHT;
       if (y >= h) break;
-      ctx.fillStyle = i % 2 === 0 ? "#0d0d14" : "#101019";
+      const isTrackSelected = props.selectedTrack === tracks[i]!.id;
+      ctx.fillStyle = isTrackSelected
+        ? "#181830"
+        : i % 2 === 0
+          ? "#0d0d14"
+          : "#101019";
       ctx.fillRect(0, y, w, TRACK_HEIGHT);
       drawTrackGrid(ctx, w, y);
     }
@@ -288,9 +302,10 @@ export function Timeline(props: TimelineProps) {
     const isSelected =
       props.selected?.trackId === track.id && props.selected?.clipId === clip.id;
 
+    const accent = track.color ?? "#7c5cff";
     ctx.save();
-    ctx.fillStyle = isSelected ? "#2a205a" : "#1b1633";
-    ctx.strokeStyle = isSelected ? "#bdb1ff" : "#7c5cff";
+    ctx.fillStyle = isSelected ? hexWithAlpha(accent, 0.32) : hexWithAlpha(accent, 0.18);
+    ctx.strokeStyle = isSelected ? lighten(accent) : accent;
     ctx.lineWidth = isSelected ? 2 : 1;
     roundRect(ctx, left, top, w, h, 6);
     ctx.fill();
@@ -320,7 +335,7 @@ export function Timeline(props: TimelineProps) {
       const yMid = top + h / 2;
       const yScale = (h / 2) * 0.92;
 
-      ctx.strokeStyle = isSelected ? "#d8ccff" : "#7c5cff";
+      ctx.strokeStyle = isSelected ? lighten(accent) : accent;
       ctx.beginPath();
       const fpp = framesPerPixel;
       const widthPx = right - left;
@@ -342,11 +357,30 @@ export function Timeline(props: TimelineProps) {
 
     // Trim handles for the selected clip — subtle inset bars.
     if (isSelected && w > EDGE_HIT_PX * 2) {
-      ctx.fillStyle = "#bdb1ff";
+      ctx.fillStyle = lighten(accent);
       ctx.fillRect(left + 2, top + h / 2 - 10, 3, 20);
       ctx.fillRect(right - 5, top + h / 2 - 10, 3, 20);
     }
     ctx.restore();
+  }
+
+  // Cheap hex (#rrggbb) alpha overlay — returns rgba string.
+  function hexWithAlpha(hex: string, a: number): string {
+    if (hex.length !== 7 || hex[0] !== "#") return hex;
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    return `rgba(${r},${g},${b},${a})`;
+  }
+
+  // Bias a color toward white by ~35%; used to brighten the selected clip's
+  // outline so it pops against its own muted fill.
+  function lighten(hex: string): string {
+    if (hex.length !== 7 || hex[0] !== "#") return hex;
+    const r = Math.min(255, parseInt(hex.slice(1, 3), 16) + 70);
+    const g = Math.min(255, parseInt(hex.slice(3, 5), 16) + 70);
+    const b = Math.min(255, parseInt(hex.slice(5, 7), 16) + 70);
+    return `rgb(${r},${g},${b})`;
   }
 
   function drawPlayhead(ctx: CanvasRenderingContext2D, _w: number, h: number) {
@@ -442,7 +476,24 @@ export function Timeline(props: TimelineProps) {
       return;
     }
 
+    const mode: TimelineMode = props.mode ?? "move";
     const hit = hitTestClip(localX, localY);
+
+    // Slice / Erase modes act on a clip hit immediately and stop here —
+    // there's no drag follow-up.
+    if (hit && mode === "slice") {
+      const sliceFrame = Math.max(0, Math.floor(xToFrame(localX)));
+      props.onSelectClip?.(hit.ref);
+      props.onClipSlice?.(hit.ref, sliceFrame);
+      gesture = { kind: "none" };
+      return;
+    }
+    if (hit && mode === "erase") {
+      props.onClipErase?.(hit.ref);
+      gesture = { kind: "none" };
+      return;
+    }
+
     if (hit) {
       props.onSelectClip?.(hit.ref);
       const track = props.project.tracks.find((t) => t.id === hit.ref.trackId)!;
@@ -498,8 +549,11 @@ export function Timeline(props: TimelineProps) {
       return;
     }
 
-    // Empty lane → pan, and deselect.
+    // Empty lane → select that track (if any) and arm a pan gesture.
     props.onSelectClip?.(null);
+    const lane = yToLane(localY);
+    const trackId = lane >= 0 ? props.project.tracks[lane]?.id ?? null : null;
+    props.onSelectTrack?.(trackId);
     gesture = { kind: "pan", startX: e.clientX, startPan: panFrames };
   }
 
@@ -636,6 +690,8 @@ export function Timeline(props: TimelineProps) {
     void props.positionFrames;
     void props.waveforms;
     void props.selected;
+    void props.selectedTrack;
+    void props.mode;
     draw();
   });
 
