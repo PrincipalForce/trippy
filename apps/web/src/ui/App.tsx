@@ -46,9 +46,11 @@ export function App() {
       /* private-browsing or storage disabled — non-fatal */
     }
   }
-  const [longPressMenu, setLongPressMenu] = createSignal<
-    { ref: ClipRef; x: number; y: number } | null
-  >(null);
+  // Inspector visibility is decoupled from selection. Tapping a clip selects
+  // it (visual highlight only) — the Inspector opens only on long-press or
+  // when the user taps the small "details" pill. This keeps the touch zone
+  // clear during routine moves.
+  const [inspectorOpen, setInspectorOpen] = createSignal(false);
 
   // Resolve the currently-selected clip into concrete track + clip snapshots
   // for the Inspector. Returns null if nothing matches.
@@ -346,7 +348,7 @@ export function App() {
     engineClipIds.delete(ref.clipId);
     project.removeClip(ref.trackId, ref.clipId);
     setSelectedClip(null);
-    setLongPressMenu(null);
+    setInspectorOpen(false);
   }
 
   // Cut a clip into two at `splitFrame` (project time). Left half retains
@@ -436,6 +438,7 @@ export function App() {
     project.removeTrack(trackId);
     setSelectedTrack(null);
     setSelectedClip(null);
+    setInspectorOpen(false);
   }
 
   // Render the project to a downloadable WAV. Bounds the render to the last
@@ -512,7 +515,6 @@ export function App() {
       engineClipIds.set(newProjClipId, eid);
     }
     setSelectedClip({ trackId: ref.trackId, clipId: newProjClipId });
-    setLongPressMenu(null);
   }
 
   return (
@@ -682,51 +684,14 @@ export function App() {
           }}
           onSelectTrack={setSelectedTrack}
           onClipChange={handleClipChange}
-          onClipLongPress={(ref, x, y) => setLongPressMenu({ ref, x, y })}
+          onClipLongPress={(ref) => {
+            setSelectedClip(ref);
+            setSelectedTrack(ref.trackId);
+            setInspectorOpen(true);
+          }}
           onClipSlice={(ref, frame) => void splitClipAt(ref, frame)}
           onClipErase={(ref) => deleteClip(ref)}
         />
-        <Show when={longPressMenu()}>
-          {(menu) => (
-            <div
-              onClick={() => setLongPressMenu(null)}
-              style={{
-                position: "fixed",
-                inset: 0,
-                "z-index": 50,
-                background: "rgba(0,0,0,0.25)",
-              }}
-            >
-              <div
-                onClick={(e) => e.stopPropagation()}
-                style={{
-                  position: "absolute",
-                  left: `${Math.min(window.innerWidth - 180, menu().x)}px`,
-                  top: `${Math.min(window.innerHeight - 140, menu().y)}px`,
-                  background: "var(--bg-elevated)",
-                  border: "1px solid var(--grid)",
-                  "border-radius": "8px",
-                  padding: "0.4rem",
-                  display: "flex",
-                  "flex-direction": "column",
-                  gap: "0.25rem",
-                  "min-width": "160px",
-                  "box-shadow": "0 6px 20px rgba(0,0,0,0.5)",
-                }}
-              >
-                <button type="button" onClick={() => duplicateClip(menu().ref)}>⎘ Duplicate</button>
-                <button
-                  type="button"
-                  onClick={() => deleteClip(menu().ref)}
-                  style={{ "border-color": "#ff4d6d", color: "#ffb8c5" }}
-                >
-                  ✕ Delete
-                </button>
-                <button type="button" onClick={() => setLongPressMenu(null)}>Cancel</button>
-              </div>
-            </div>
-          )}
-        </Show>
       </section>
 
       {/* Mixer strip */}
@@ -775,6 +740,38 @@ export function App() {
         </section>
       </Show>
 
+      {/* Floating "details" pill: visible only when something is selected
+          and the Inspector is closed. Bottom-right so it doesn't sit under
+          the user's finger during a drag. Long-press a clip to skip it. */}
+      <Show
+        when={
+          !inspectorOpen() &&
+          (selectedClipDetail() || selectedTrackSnap())
+        }
+      >
+        <button
+          type="button"
+          onClick={() => setInspectorOpen(true)}
+          style={{
+            position: "fixed",
+            right: "0.9rem",
+            bottom: "calc(0.9rem + env(safe-area-inset-bottom))",
+            "z-index": 20,
+            "min-height": "40px",
+            padding: "0 0.85rem",
+            "border-radius": "999px",
+            background: "var(--accent-dim)",
+            "border-color": "var(--accent)",
+            color: "var(--fg)",
+            "font-weight": 600,
+            "box-shadow": "0 4px 14px rgba(0,0,0,0.45)",
+          }}
+        >
+          ⓘ details
+        </button>
+      </Show>
+
+      <Show when={inspectorOpen()}>
       <Inspector
         selectedClip={selectedClipDetail()}
         selectedTrack={selectedTrackSnap()}
@@ -808,11 +805,9 @@ export function App() {
           const id = selectedTrack();
           if (id != null) deleteTrack(id);
         }}
-        onClose={() => {
-          setSelectedClip(null);
-          setSelectedTrack(null);
-        }}
+        onClose={() => setInspectorOpen(false)}
       />
+      </Show>
 
       <AiPanel />
 
