@@ -37,7 +37,8 @@ export type EngineCommand =
   | { type: "setTrackMute"; trackId: number; mute: boolean }
   | { type: "setTrackSolo"; trackId: number; solo: boolean }
   | { type: "removeClip"; trackId: number; clipId: number }
-  | { type: "removeTrack"; trackId: number };
+  | { type: "removeTrack"; trackId: number }
+  | { type: "renderOffline"; frameCount: number; requestId: number };
 
 // Events emitted back to the main thread.
 export type EngineEvent =
@@ -52,12 +53,20 @@ export type EngineEvent =
     }
   | { type: "trackAdded"; requestId: number; trackId: number }
   | { type: "clipAdded"; requestId: number; clipId: number }
+  | {
+      type: "renderedOffline";
+      requestId: number;
+      interleaved: Float32Array;
+      sampleRate: number;
+      frameCount: number;
+    }
   | { type: "error"; message: string; requestId?: number }
   | { type: "position"; frame: number; playing: boolean };
 
 let engine: WasmEngine | null = null;
 let rb: RingBuffer | null = null;
 let running = false;
+let initSampleRate = 48_000;
 
 // Reusable mix buffers, sized to the chunk we render per iteration.
 // 512 frames @ 48 kHz ≈ 10.6ms — plenty of slack vs the worklet's 128-frame
@@ -75,8 +84,80 @@ async function handleInit(cmd: Extract<EngineCommand, { type: "init" }>) {
   await init(cmd.wasmUrl);
   engine = new WasmEngine(cmd.sampleRate);
   rb = attachRingBuffer(cmd.ringSab);
+  initSampleRate = cmd.sampleRate;
   emit({ type: "ready", sampleRate: cmd.sampleRate });
   startRenderLoop();
+}
+
+// Pause the realtime render loop, rewind to 0, render `frameCount` straight
+// through into an interleaved stereo Float32Array, then restore state and
+// resume realtime. Returns the buffer to the main thread via transferable.
+//
+// Loops are intentionally cleared during the render — exporting always wants
+// the linear timeline, not the looped section. The previous loop is *not*
+// restored afterward (the engine has no getter for it), so the user must
+// re-set the loop after export. Acceptable trade-off given the rarity.
+function renderOffline(frameCount: number, requestId: number) {
+  if (!engine) {
+    emit({ type: "error", message: "engine not initialised", requestId });
+    return;
+  }
+  if (frameCount <= 0) {
+    emit({ type: "error", message: "renderOffline: frameCount must be > 0", requestId });
+    return;
+  }
+  const wasRunning = running;
+  running = false; // tick() will short-circuit on next entry
+  const savedPos = engine.positionFrames();
+  const wasPlaying = engine.isPlaying();
+
+  engine.clearLoop();
+  engine.setPosition(0);
+  engine.play();
+
+  const interleaved = new Float32Array(frameCount * 2);
+  const chunkL = new Float32Array(CHUNK_FRAMES);
+  const chunkR = new Float32Array(CHUNK_FRAMES);
+  let written = 0;
+  try {
+    while (written < frameCount) {
+      const remain = frameCount - written;
+      if (remain >= CHUNK_FRAMES) {
+        engine.process(chunkL, chunkR);
+        for (let i = 0; i < CHUNK_FRAMES; i++) {
+          interleaved[(written + i) * 2] = chunkL[i]!;
+          interleaved[(written + i) * 2 + 1] = chunkR[i]!;
+        }
+        written += CHUNK_FRAMES;
+      } else {
+        const partL = new Float32Array(remain);
+        const partR = new Float32Array(remain);
+        engine.process(partL, partR);
+        for (let i = 0; i < remain; i++) {
+          interleaved[(written + i) * 2] = partL[i]!;
+          interleaved[(written + i) * 2 + 1] = partR[i]!;
+        }
+        written += remain;
+      }
+    }
+  } finally {
+    engine.stop();
+    engine.setPosition(savedPos);
+    if (wasPlaying) engine.play();
+    running = wasRunning;
+    if (wasRunning) startRenderLoop();
+  }
+
+  emit(
+    {
+      type: "renderedOffline",
+      requestId,
+      interleaved,
+      sampleRate: initSampleRate,
+      frameCount,
+    },
+    [interleaved.buffer],
+  );
 }
 
 function startRenderLoop() {
@@ -202,6 +283,9 @@ self.onmessage = async (e: MessageEvent<EngineCommand>) => {
         break;
       case "removeTrack":
         engine.removeTrack(cmd.trackId);
+        break;
+      case "renderOffline":
+        renderOffline(cmd.frameCount, cmd.requestId);
         break;
     }
   } catch (err) {

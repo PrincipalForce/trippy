@@ -173,6 +173,24 @@ export class AudioController {
     this.worker.postMessage({ type: "removeTrack", trackId } satisfies EngineCommand);
   }
 
+  /** Render `frameCount` frames straight-through into a stereo-interleaved
+   *  Float32Array. Pauses realtime playback for the duration of the render
+   *  and restores transport position afterward. */
+  async renderOffline(
+    frameCount: number,
+  ): Promise<{ interleaved: Float32Array; sampleRate: number; frameCount: number }> {
+    const ev = await this.request<Extract<EngineEvent, { type: "renderedOffline" }>>((id) => ({
+      type: "renderOffline",
+      frameCount,
+      requestId: id,
+    }));
+    return {
+      interleaved: ev.interleaved,
+      sampleRate: ev.sampleRate,
+      frameCount: ev.frameCount,
+    };
+  }
+
   play() {
     this.worker.postMessage({ type: "play" } satisfies EngineCommand);
   }
