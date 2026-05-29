@@ -884,7 +884,36 @@ export function App() {
       />
       </Show>
 
-      <AiPanel />
+      <AiPanel
+        project={project.state.project}
+        onApply={(commands) => {
+          for (const c of commands) {
+            switch (c.type) {
+              case "setTrackGain": {
+                const t = project.state.project.tracks.find((tr) => tr.id === c.trackId);
+                if (!t) break;
+                // The schema sends delta_db; convert to absolute linear gain.
+                const newLinear = Math.max(0, t.gain * Math.pow(10, c.gain / 20));
+                project.updateTrack(c.trackId, { gain: newLinear });
+                const eid = engineTrackIds.get(c.trackId);
+                if (eid != null) controller.setTrackGain(eid, newLinear);
+                break;
+              }
+              case "setTrackPan": {
+                project.updateTrack(c.trackId, { pan: c.pan });
+                const eid = engineTrackIds.get(c.trackId);
+                if (eid != null) controller.setTrackPan(eid, c.pan);
+                break;
+              }
+              // EQ / compressor / delay / sidechain: no engine plumbing yet.
+              // AiPanel labels these "engine-pending" so the user sees the
+              // intent without us silently no-op'ing them.
+              default:
+                break;
+            }
+          }
+        }}
+      />
 
       <Show when={error()}>
         <div

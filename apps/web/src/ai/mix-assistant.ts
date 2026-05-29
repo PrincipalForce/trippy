@@ -73,13 +73,134 @@ export function summarizeProject(p: ProjectFile): ProjectContextSummary {
 }
 
 /**
- * Send a request to the mix assistant. Throws until the Workers AI gateway
- * lands in M8 — the UI handles the error with a "coming soon" message.
+ * Send a request to the mix assistant. Posts the prompt + project context
+ * summary to the Cloudflare Worker gateway whose URL is configured via
+ * `VITE_AI_GATEWAY_URL`. Returns a list of {tool, args} commands the caller
+ * resolves into typed `EngineCommandSuggestion`s via `resolveCommand`.
+ *
+ * Throws with a useful message if the env var is unset, the gateway is
+ * unreachable, or the gateway returns an error body.
  */
-export async function callMixAssistant(_req: MixAssistantRequest): Promise<MixAssistantResponse> {
-  throw new Error(
-    "mix-assistant cloud gateway not yet deployed (M8 work — see docs/M8-cloud.md)",
-  );
+export async function callMixAssistant(req: MixAssistantRequest): Promise<MixAssistantResponse> {
+  const url = import.meta.env.VITE_AI_GATEWAY_URL;
+  if (!url) {
+    throw new Error(
+      "mix-assistant not configured: set VITE_AI_GATEWAY_URL in apps/web/.env.local and rebuild",
+    );
+  }
+  const endpoint = `${url.replace(/\/+$/, "")}/mix-assistant`;
+  let res: Response;
+  try {
+    res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: req.prompt, context: req.context }),
+    });
+  } catch (err) {
+    throw new Error(`gateway unreachable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`gateway ${res.status}: ${body.slice(0, 200)}`);
+  }
+  const data = (await res.json()) as {
+    commands?: Array<{ tool: string; args: Record<string, unknown> }>;
+    needsClarification?: string;
+    error?: string;
+  };
+  if (data.error) throw new Error(data.error);
+  const commands: EngineCommandSuggestion[] = [];
+  for (const raw of data.commands ?? []) {
+    const resolved = resolveCommand(raw.tool, raw.args);
+    if (resolved) commands.push(resolved);
+  }
+  return data.needsClarification
+    ? { commands, needsClarification: data.needsClarification }
+    : { commands };
+}
+
+/** Validate + normalize a raw tool call into a typed engine suggestion.
+ *  Returns null for unknown tools so the rest of the batch still flows.
+ *  Kept defensive — the LLM can hallucinate keys or types. */
+export function resolveCommand(
+  tool: string,
+  args: Record<string, unknown>,
+): EngineCommandSuggestion | null {
+  const num = (k: string) => (typeof args[k] === "number" ? (args[k] as number) : NaN);
+  const int = (k: string) => {
+    const v = args[k];
+    return typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : NaN;
+  };
+  const str = (k: string) => (typeof args[k] === "string" ? (args[k] as string) : "");
+  switch (tool) {
+    case "set_track_gain": {
+      const trackId = int("track_id");
+      const delta = num("delta_db");
+      if (!Number.isFinite(trackId) || !Number.isFinite(delta)) return null;
+      // Stored as a *relative* dB change; the executor reads the current
+      // gain and applies. The schema is "delta" not "absolute" so the LLM
+      // doesn't need to know the current value.
+      return { type: "setTrackGain", trackId, gain: delta, rationale: str("rationale") };
+    }
+    case "set_track_pan": {
+      const trackId = int("track_id");
+      const pan = num("pan");
+      if (!Number.isFinite(trackId) || !Number.isFinite(pan)) return null;
+      return {
+        type: "setTrackPan",
+        trackId,
+        pan: Math.max(-1, Math.min(1, pan)),
+        rationale: str("rationale"),
+      };
+    }
+    case "add_eq_band": {
+      const trackId = int("track_id");
+      const freq = num("freq_hz");
+      const q = num("q");
+      const gainDb = num("gain_db");
+      if (!Number.isFinite(trackId) || !Number.isFinite(freq)) return null;
+      return {
+        type: "addEq",
+        trackId,
+        freq,
+        q: Number.isFinite(q) ? q : 1,
+        gainDb: Number.isFinite(gainDb) ? gainDb : 0,
+        rationale: str("rationale"),
+      };
+    }
+    case "add_compressor": {
+      const trackId = int("track_id");
+      if (!Number.isFinite(trackId)) return null;
+      return {
+        type: "addCompressor",
+        trackId,
+        thresholdDb: num("threshold_db"),
+        ratio: num("ratio"),
+        rationale: str("rationale"),
+      };
+    }
+    case "add_delay": {
+      const trackId = int("track_id");
+      const beats = num("beats");
+      if (!Number.isFinite(trackId) || !Number.isFinite(beats)) return null;
+      return {
+        type: "addDelay",
+        trackId,
+        beats,
+        feedback: num("feedback"),
+        wet: num("wet"),
+        rationale: str("rationale"),
+      };
+    }
+    case "sidechain": {
+      const from = int("from_track_id");
+      const to = int("to_track_id");
+      if (!Number.isFinite(from) || !Number.isFinite(to)) return null;
+      return { type: "sidechain", from, to, rationale: str("rationale") };
+    }
+    default:
+      return null;
+  }
 }
 
 /** Tool schema we'll register with the LLM once the gateway is live. */

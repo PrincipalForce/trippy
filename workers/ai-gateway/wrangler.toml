@@ -1,0 +1,19 @@
+name = "trippy-ai-gateway"
+main = "src/index.ts"
+compatibility_date = "2026-01-15"
+compatibility_flags = ["nodejs_compat"]
+
+# Adjust to your preferred custom route once a domain is attached. Until then
+# the *.workers.dev hostname (printed by `wrangler deploy`) is what the web
+# app should point VITE_AI_GATEWAY_URL at.
+# routes = [{ pattern = "ai.trippy.app/*", custom_domain = true }]
+
+# CORS origin allow-list. Local dev + the deployed PWA origin.
+# Override per-environment with `[env.production].vars` if you deploy to
+# multiple stages.
+[vars]
+ALLOWED_ORIGINS = "http://localhost:5173,https://trippy.pages.dev"
+
+# Required runtime secret. Set with:
+#   wrangler secret put ANTHROPIC_API_KEY
+# (never commit it).
