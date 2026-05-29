@@ -27,7 +27,12 @@ export function AiPanel(props: AiPanelProps) {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [clarification, setClarification] = createSignal<string | null>(null);
+  // Each suggestion carries a stable index used as the key for the
+  // accepted-set; "rejected" rows are simply not in the set. Keeping the
+  // full list around (rather than splicing) means undo is just a toggle.
   const [suggestions, setSuggestions] = createSignal<EngineCommandSuggestion[]>([]);
+  const [accepted, setAccepted] = createSignal<Set<number>>(new Set());
+  const [rejected, setRejected] = createSignal<Set<number>>(new Set());
 
   async function ask() {
     const text = prompt().trim();
@@ -42,6 +47,14 @@ export function AiPanel(props: AiPanelProps) {
         context: summarizeProject(props.project),
       });
       setSuggestions(res.commands);
+      // Pre-accept supported suggestions so the user can just tap Apply.
+      // They can still reject any row individually before applying.
+      const preAccept = new Set<number>();
+      res.commands.forEach((c, i) => {
+        if (isEngineSupported(c)) preAccept.add(i);
+      });
+      setAccepted(preAccept);
+      setRejected(new Set<number>());
       if (res.needsClarification) setClarification(res.needsClarification);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -50,17 +63,47 @@ export function AiPanel(props: AiPanelProps) {
     }
   }
 
-  function applyAll() {
-    if (suggestions().length === 0) return;
-    props.onApply(suggestions());
+  function acceptedCommands(): EngineCommandSuggestion[] {
+    const a = accepted();
+    return suggestions().filter((_, i) => a.has(i));
+  }
+
+  function applyAccepted() {
+    const cmds = acceptedCommands();
+    if (cmds.length === 0) return;
+    props.onApply(cmds);
     setSuggestions([]);
+    setAccepted(new Set<number>());
+    setRejected(new Set<number>());
     setPrompt("");
   }
 
   function dismissAll() {
     setSuggestions([]);
+    setAccepted(new Set<number>());
+    setRejected(new Set<number>());
     setClarification(null);
     setError(null);
+  }
+
+  function toggleRow(idx: number, action: "accept" | "reject") {
+    const a = new Set<number>(accepted());
+    const r = new Set<number>(rejected());
+    if (action === "accept") {
+      if (a.has(idx)) a.delete(idx);
+      else {
+        a.add(idx);
+        r.delete(idx);
+      }
+    } else {
+      if (r.has(idx)) r.delete(idx);
+      else {
+        r.add(idx);
+        a.delete(idx);
+      }
+    }
+    setAccepted(a);
+    setRejected(r);
   }
 
   return (
@@ -132,16 +175,29 @@ export function AiPanel(props: AiPanelProps) {
       <Show when={suggestions().length > 0}>
         <div style={{ display: "flex", "flex-direction": "column", gap: "0.3rem" }}>
           <For each={suggestions()}>
-            {(s) => <SuggestionRow project={props.project} suggestion={s} />}
+            {(s, i) => (
+              <SuggestionRow
+                project={props.project}
+                suggestion={s}
+                accepted={accepted().has(i())}
+                rejected={rejected().has(i())}
+                onAccept={() => toggleRow(i(), "accept")}
+                onReject={() => toggleRow(i(), "reject")}
+              />
+            )}
           </For>
-          <div style={{ display: "flex", gap: "0.4rem" }}>
+          <div style={{ display: "flex", gap: "0.4rem", "align-items": "center" }}>
             <button
-              onClick={applyAll}
+              onClick={applyAccepted}
+              disabled={acceptedCommands().length === 0}
               style={{ "border-color": "#5cff8c", color: "#c0ffc0" }}
             >
-              ✓ Apply all
+              ✓ Apply {acceptedCommands().length}
             </button>
             <button onClick={dismissAll}>Dismiss</button>
+            <span style={{ color: "var(--fg-dim)", "font-size": "0.78rem" }}>
+              {accepted().size} accepted · {rejected().size} rejected
+            </span>
           </div>
         </div>
       </Show>
@@ -149,45 +205,100 @@ export function AiPanel(props: AiPanelProps) {
   );
 }
 
-function SuggestionRow(props: { project: ProjectFile; suggestion: EngineCommandSuggestion }) {
+function SuggestionRow(props: {
+  project: ProjectFile;
+  suggestion: EngineCommandSuggestion;
+  accepted: boolean;
+  rejected: boolean;
+  onAccept: () => void;
+  onReject: () => void;
+}) {
   const trackName = (id: number) =>
     props.project.tracks.find((t) => t.id === id)?.name ?? `track ${id}`;
   const summary = () => describeSuggestion(props.suggestion, trackName);
   const supported = () => isEngineSupported(props.suggestion);
+  const bg = () => (props.rejected ? "#1f0f0f" : props.accepted ? "#0f1f12" : "var(--bg)");
+  const border = () =>
+    props.rejected ? "#6e2222" : props.accepted ? "#2a6e3a" : "var(--grid)";
   return (
     <div
       style={{
         display: "flex",
-        "flex-direction": "column",
-        gap: "0.15rem",
+        gap: "0.4rem",
+        "align-items": "center",
         padding: "0.4rem 0.55rem",
-        background: "var(--bg)",
-        border: "1px solid var(--grid)",
+        background: bg(),
+        border: `1px solid ${border()}`,
         "border-radius": "6px",
+        opacity: props.rejected ? 0.6 : 1,
       }}
     >
-      <div style={{ display: "flex", gap: "0.4rem", "align-items": "center" }}>
-        <span style={{ "font-size": "0.85rem", "font-weight": 600 }}>{summary()}</span>
-        <Show when={!supported()}>
+      <div style={{ flex: 1, display: "flex", "flex-direction": "column", gap: "0.15rem", "min-width": 0 }}>
+        <div style={{ display: "flex", gap: "0.4rem", "align-items": "center", "flex-wrap": "wrap" }}>
           <span
-            title="The engine doesn't have plumbing for this yet — Apply will skip it."
             style={{
-              "font-size": "0.7rem",
-              color: "#ffb86b",
-              padding: "0.1rem 0.4rem",
-              border: "1px solid #5a3e1a",
-              "border-radius": "999px",
+              "font-size": "0.85rem",
+              "font-weight": 600,
+              "text-decoration": props.rejected ? "line-through" : "none",
             }}
           >
-            engine-pending
+            {summary()}
+          </span>
+          <Show when={!supported()}>
+            <span
+              title="The engine doesn't have plumbing for this yet — Apply will skip it."
+              style={{
+                "font-size": "0.7rem",
+                color: "#ffb86b",
+                padding: "0.1rem 0.4rem",
+                border: "1px solid #5a3e1a",
+                "border-radius": "999px",
+              }}
+            >
+              engine-pending
+            </span>
+          </Show>
+        </div>
+        <Show when={props.suggestion.rationale}>
+          <span style={{ "font-size": "0.78rem", color: "var(--fg-dim)" }}>
+            {props.suggestion.rationale}
           </span>
         </Show>
       </div>
-      <Show when={props.suggestion.rationale}>
-        <span style={{ "font-size": "0.78rem", color: "var(--fg-dim)" }}>
-          {props.suggestion.rationale}
-        </span>
-      </Show>
+      <div style={{ display: "flex", gap: "0.25rem" }}>
+        <button
+          type="button"
+          aria-pressed={props.accepted}
+          onClick={props.onAccept}
+          title={props.accepted ? "Accepted (tap to clear)" : "Accept this suggestion"}
+          style={{
+            "min-width": "34px",
+            "min-height": "32px",
+            padding: "0 0.4rem",
+            "border-color": props.accepted ? "#5cff8c" : "var(--grid)",
+            background: props.accepted ? "#1f3a26" : "transparent",
+            color: props.accepted ? "#c0ffc0" : "var(--fg-dim)",
+          }}
+        >
+          ✓
+        </button>
+        <button
+          type="button"
+          aria-pressed={props.rejected}
+          onClick={props.onReject}
+          title={props.rejected ? "Rejected (tap to clear)" : "Reject this suggestion"}
+          style={{
+            "min-width": "34px",
+            "min-height": "32px",
+            padding: "0 0.4rem",
+            "border-color": props.rejected ? "#ff4d6d" : "var(--grid)",
+            background: props.rejected ? "#3a1020" : "transparent",
+            color: props.rejected ? "#ffb8c5" : "var(--fg-dim)",
+          }}
+        >
+          ✕
+        </button>
+      </div>
     </div>
   );
 }
