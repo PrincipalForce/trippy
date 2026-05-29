@@ -2,6 +2,7 @@ import { createSignal, onCleanup, onMount, Show, For, createMemo } from "solid-j
 import { getController } from "../audio/controller";
 import { decodeAudio } from "../audio/decode";
 import { encodeWavPcm16 } from "../audio/wav-encode";
+import { detectTempo } from "../ai/tempo";
 import { buildWaveform, type Waveform } from "../audio/waveform-cache";
 import { createProjectStore } from "../project/store";
 import { Timeline, type ClipRef, type ClipPatch } from "./timeline/Timeline";
@@ -51,6 +52,14 @@ export function App() {
   // when the user taps the small "details" pill. This keeps the touch zone
   // clear during routine moves.
   const [inspectorOpen, setInspectorOpen] = createSignal(false);
+  // A pending tempo suggestion surfaced after a clip is imported with a
+  // confident BPM estimate. User can adopt or dismiss.
+  const [tempoSuggestion, setTempoSuggestion] = createSignal<
+    { bpm: number; sourceLabel: string } | null
+  >(null);
+  // Tracks whether the user has manually set the project BPM — we only
+  // *auto*-adopt detected tempo on the very first import.
+  let bpmIsUserSet = false;
 
   // Resolve the currently-selected clip into concrete track + clip snapshots
   // for the Inspector. Returns null if nothing matches.
@@ -176,6 +185,27 @@ export function App() {
         controller.setLoop(0, engineSrc.frameCount);
         project.setLoop({ start: 0, end: engineSrc.frameCount });
       }
+
+      // 6) Detect tempo. Cheap on a Float32Array we already have decoded.
+      //    Run it after the UI work above so the user sees the clip land
+      //    immediately and the BPM banner pops in a beat later.
+      queueMicrotask(() => {
+        const t = detectTempo(decoded.channels, decoded.sampleRate);
+        if (t.confidence < 0.25) return;
+        const projBpm = project.state.project.transport.bpm;
+        const isFirstClip = project.state.project.tracks.length === 1;
+        const rounded = Math.round(t.bpm);
+        // Auto-adopt only on the first import and only if the user hasn't
+        // typed a BPM. Otherwise surface as a dismissible suggestion.
+        if (isFirstClip && !bpmIsUserSet) {
+          project.setBpm(rounded);
+          controller.setBpm(rounded);
+          return;
+        }
+        if (Math.abs(rounded - projBpm) >= 1) {
+          setTempoSuggestion({ bpm: rounded, sourceLabel: friendly });
+        }
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -599,6 +629,7 @@ export function App() {
               value={bpm()}
               onChange={(e) => {
                 const v = parseFloat(e.currentTarget.value) || 120;
+                bpmIsUserSet = true;
                 project.setBpm(v);
                 controller.setBpm(v);
               }}
@@ -659,6 +690,50 @@ export function App() {
           <span style={{ color: "#ffb86b", "font-size": "0.8rem" }}>● unsaved</span>
         </Show>
       </header>
+
+      <Show when={tempoSuggestion()}>
+        {(s) => (
+          <div
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: "0.5rem",
+              padding: "0.4rem 0.7rem",
+              background: "#1c2a1c",
+              "border-bottom": "1px solid #2a4a2a",
+              "font-size": "0.85rem",
+              "flex-wrap": "wrap",
+            }}
+          >
+            <span aria-hidden>♪</span>
+            <span style={{ color: "#c0e6c0" }}>
+              <em style={{ "font-style": "normal", "font-weight": 600 }}>{s().sourceLabel}</em>
+              {" "}looks like{" "}
+              <strong style={{ color: "#fff" }}>{s().bpm} BPM</strong>.
+            </span>
+            <span style={{ flex: 1 }} />
+            <button
+              type="button"
+              onClick={() => {
+                bpmIsUserSet = true;
+                project.setBpm(s().bpm);
+                controller.setBpm(s().bpm);
+                setTempoSuggestion(null);
+              }}
+              style={{ "border-color": "#5cff8c", color: "#c0ffc0", "min-height": "32px" }}
+            >
+              Use {s().bpm} BPM
+            </button>
+            <button
+              type="button"
+              onClick={() => setTempoSuggestion(null)}
+              style={{ "min-height": "32px" }}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+      </Show>
 
       <ModeBar mode={mode()} onChange={setMode} />
 
