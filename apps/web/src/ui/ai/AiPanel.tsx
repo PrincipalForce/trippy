@@ -324,8 +324,17 @@ function describeSuggestion(
 }
 
 function isEngineSupported(s: EngineCommandSuggestion): boolean {
-  // The engine currently only honors track gain & pan. EQ/comp/delay/sidechain
-  // are scaffolded but not yet wired through the audio graph; until they are,
-  // Apply skips them with a one-line notice.
-  return s.type === "setTrackGain" || s.type === "setTrackPan";
+  // gain/pan + EQ/comp/delay are now wired through to the audio graph.
+  // Sidechain still requires cross-track signal routing that doesn't exist
+  // yet, so it remains preview-only.
+  switch (s.type) {
+    case "setTrackGain":
+    case "setTrackPan":
+    case "addEq":
+    case "addCompressor":
+    case "addDelay":
+      return true;
+    case "sidechain":
+      return false;
+  }
 }

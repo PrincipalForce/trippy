@@ -1,16 +1,13 @@
 //! Engine processing graph: tracks → mixer → master out.
 //!
-//! M1 architecture is intentionally flat:
+//! Per-track flow:
 //!
 //! ```text
-//!   Track[0] ──┐
-//!   Track[1] ──┼──> Mixer (sum + master gain) ──> stereo out
-//!   ...      ──┘
+//!   clips ──► sum into scratch ──► FX chain (in order) ──► pan/gain ──► master sum
 //! ```
 //!
-//! M4 inserts per-track FX chains and sends; M5 inserts per-parameter
-//! automation evaluation. The flat shape here keeps the M1 audio-thread
-//! callback allocation-free and easy to reason about.
+//! Scratch buffers are owned by the caller (the engine) so the audio callback
+//! itself never allocates. They grow lazily to the largest seen chunk size.
 
 use crate::clip::Clip;
 use crate::track::Track;
@@ -29,56 +26,76 @@ pub struct ProcessContext {
 /// Render `frames` of stereo audio from the given tracks into `out_l`/`out_r`,
 /// starting at project-frame `ctx.start_frame`.
 ///
+/// Scratch buffers (`scratch_l`/`scratch_r`) are reused across tracks — the
+/// engine owns them so the audio callback itself never allocates. They must
+/// be at least `ctx.frames` long.
+///
 /// The output buffers are *overwritten*, not added to. Callers wanting to mix
 /// into existing audio should sum afterward.
-///
-/// This is the hot path: no allocations, no virtual dispatch, no I/O.
-pub fn render_master(ctx: ProcessContext, tracks: &[Track], out_l: &mut [f32], out_r: &mut [f32]) {
+pub fn render_master(
+    ctx: ProcessContext,
+    tracks: &mut [Track],
+    scratch_l: &mut [f32],
+    scratch_r: &mut [f32],
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+) {
     debug_assert_eq!(out_l.len(), ctx.frames);
     debug_assert_eq!(out_r.len(), ctx.frames);
+    debug_assert!(scratch_l.len() >= ctx.frames);
+    debug_assert!(scratch_r.len() >= ctx.frames);
 
-    // Zero the output. (Could `out_l.fill(0.0)` but explicit loop is clearer.)
-    for s in out_l.iter_mut() {
-        *s = 0.0;
-    }
-    for s in out_r.iter_mut() {
-        *s = 0.0;
-    }
+    out_l.fill(0.0);
+    out_r.fill(0.0);
 
     if !ctx.playing {
         return;
     }
 
-    // Solo logic: if any track is soloed, only soloed tracks render.
     let any_solo = tracks.iter().any(|t| t.solo);
 
-    for track in tracks {
+    for track in tracks.iter_mut() {
         if track.mute {
             continue;
         }
         if any_solo && !track.solo {
             continue;
         }
-        let (pan_l, pan_r) = track.pan_gains();
-        let track_gain = track.gain;
 
+        // 1. Sum all of this track's clips, pre-pan/gain/FX, into the scratch
+        //    stereo buses. Mono sources duplicate to both; stereo sources go
+        //    straight through. Clip gain is applied here.
+        let s_l = &mut scratch_l[..ctx.frames];
+        let s_r = &mut scratch_r[..ctx.frames];
+        s_l.fill(0.0);
+        s_r.fill(0.0);
         for clip in &track.clips {
-            mix_clip_into(ctx, clip, pan_l, pan_r, track_gain, out_l, out_r);
+            mix_clip_into_scratch(ctx, clip, s_l, s_r);
+        }
+
+        // 2. Run FX chain in-place on the scratch buses.
+        for fx in track.fx_chain.iter_mut() {
+            fx.process(s_l, s_r);
+        }
+
+        // 3. Apply pan + track gain, sum into master.
+        let (pan_l, pan_r) = track.pan_gains();
+        let gain_l = track.gain * pan_l;
+        let gain_r = track.gain * pan_r;
+        for i in 0..ctx.frames {
+            out_l[i] += s_l[i] * gain_l;
+            out_r[i] += s_r[i] * gain_r;
         }
     }
 }
 
-/// Mix a single clip's contribution into the stereo buses.
-///
-/// Walks the overlap between the render window `[start, start+frames)` and the
-/// clip's active range `[clip.start_frame, clip.end_frame())`, copies samples
-/// from the source, applies clip gain + track gain + pan, and sums into out.
-fn mix_clip_into(
+/// Mix a single clip's contribution into the per-track scratch buses
+/// (pre-pan, pre-gain, pre-FX). Mono sources duplicate to both channels at
+/// equal amplitude (the constant-power pan law in step 3 restores perceived
+/// loudness when applied post-FX).
+fn mix_clip_into_scratch(
     ctx: ProcessContext,
     clip: &Clip,
-    pan_l: f32,
-    pan_r: f32,
-    track_gain: f32,
     out_l: &mut [f32],
     out_r: &mut [f32],
 ) {
@@ -87,7 +104,6 @@ fn mix_clip_into(
     let clip_start = clip.start_frame;
     let clip_end = clip.end_frame();
 
-    // Compute overlap in project-frame coordinates.
     let overlap_start = win_start.max(clip_start);
     let overlap_end = win_end.min(clip_end);
     if overlap_start >= overlap_end {
@@ -104,31 +120,34 @@ fn mix_clip_into(
     }
     let actual_frames = copy_frames.min(src_len - src_idx);
 
-    let gain_l = clip.gain * track_gain * pan_l;
-    let gain_r = clip.gain * track_gain * pan_r;
-
+    let g = clip.gain;
     let chans = &clip.source.channels;
     match chans.len() {
         1 => {
+            // Mono → duplicate at unity into both buses. The post-FX
+            // constant-power pan (each leg = 1/sqrt(2) at center) then
+            // attenuates by sqrt(2)/2, matching the legacy behavior where
+            // mono center pan produced 0.5 × sqrt(0.5) per channel.
             let src = &chans[0][src_idx..src_idx + actual_frames];
             for (i, &s) in src.iter().enumerate() {
-                out_l[out_offset + i] += s * gain_l;
-                out_r[out_offset + i] += s * gain_r;
+                let v = s * g;
+                out_l[out_offset + i] += v;
+                out_r[out_offset + i] += v;
             }
         }
         2 => {
+            // Stereo source: feed each side straight through, scaled
+            // so that the post-FX center pan reproduces unity gain.
             let src_l = &chans[0][src_idx..src_idx + actual_frames];
             let src_r = &chans[1][src_idx..src_idx + actual_frames];
+            let pre = g * std::f32::consts::SQRT_2;
             for i in 0..actual_frames {
-                // For stereo sources, pan acts as a balance: left source goes
-                // to left out scaled by pan_l*sqrt(2), right to right scaled by
-                // pan_r*sqrt(2). At pan=0 (pan_l=pan_r=sqrt(0.5)) this is unity.
-                out_l[out_offset + i] += src_l[i] * gain_l * std::f32::consts::SQRT_2;
-                out_r[out_offset + i] += src_r[i] * gain_r * std::f32::consts::SQRT_2;
+                out_l[out_offset + i] += src_l[i] * pre;
+                out_r[out_offset + i] += src_r[i] * pre;
             }
         }
         _ => {
-            // Other layouts not supported at M1.
+            // Other layouts not supported.
         }
     }
 }
@@ -137,7 +156,9 @@ fn mix_clip_into(
 /// transport. Returns the (possibly looped) new transport position.
 pub fn process(
     transport: &mut Transport,
-    tracks: &[Track],
+    tracks: &mut [Track],
+    scratch_l: &mut [f32],
+    scratch_r: &mut [f32],
     out_l: &mut [f32],
     out_r: &mut [f32],
 ) -> u64 {
@@ -149,7 +170,7 @@ pub fn process(
         frames,
         playing: transport.playing,
     };
-    render_master(ctx, tracks, out_l, out_r);
+    render_master(ctx, tracks, scratch_l, scratch_r, out_l, out_r);
     if transport.playing {
         transport.advance(frames as u64)
     } else {
@@ -175,13 +196,20 @@ mod tests {
         })
     }
 
+    fn buf(n: usize) -> Vec<f32> {
+        vec![0.0; n]
+    }
+
     #[test]
     fn silence_when_stopped() {
         let mut t = Transport::new(48_000.0);
         t.playing = false;
         let mut l = vec![1.0; 128];
         let mut r = vec![1.0; 128];
-        process(&mut t, &[], &mut l, &mut r);
+        let mut sl = buf(128);
+        let mut sr = buf(128);
+        let mut tracks: Vec<Track> = vec![];
+        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
         assert!(l.iter().all(|&s| s == 0.0));
         assert!(r.iter().all(|&s| s == 0.0));
     }
@@ -201,9 +229,12 @@ mod tests {
 
         let mut t = Transport::new(48_000.0);
         t.playing = true;
-        let mut l = vec![0.0; 128];
-        let mut r = vec![0.0; 128];
-        process(&mut t, &[track], &mut l, &mut r);
+        let mut l = buf(128);
+        let mut r = buf(128);
+        let mut sl = buf(128);
+        let mut sr = buf(128);
+        let mut tracks = vec![track];
+        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
 
         // Center pan ≈ sqrt(0.5). 0.5 * sqrt(0.5) ≈ 0.3536
         let expected = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
@@ -228,10 +259,12 @@ mod tests {
 
         let mut t = Transport::new(48_000.0);
         t.playing = true;
-        let mut l = vec![0.0; 128];
-        let mut r = vec![0.0; 128];
-        process(&mut t, &[track], &mut l, &mut r);
-
+        let mut l = buf(128);
+        let mut r = buf(128);
+        let mut sl = buf(128);
+        let mut sr = buf(128);
+        let mut tracks = vec![track];
+        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
         assert!(l.iter().all(|&s| s == 0.0));
     }
 
@@ -251,9 +284,12 @@ mod tests {
 
         let mut t = Transport::new(48_000.0);
         t.playing = true;
-        let mut l = vec![0.0; 64];
-        let mut r = vec![0.0; 64];
-        process(&mut t, &[track], &mut l, &mut r);
+        let mut l = buf(64);
+        let mut r = buf(64);
+        let mut sl = buf(64);
+        let mut sr = buf(64);
+        let mut tracks = vec![track];
+        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
         assert!(l.iter().all(|&s| s == 0.0));
     }
 
@@ -283,9 +319,12 @@ mod tests {
 
         let mut t = Transport::new(48_000.0);
         t.playing = true;
-        let mut l = vec![0.0; 64];
-        let mut r = vec![0.0; 64];
-        process(&mut t, &[track_a, track_b], &mut l, &mut r);
+        let mut l = buf(64);
+        let mut r = buf(64);
+        let mut sl = buf(64);
+        let mut sr = buf(64);
+        let mut tracks = vec![track_a, track_b];
+        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
 
         // Only track_b plays. Magnitude = 0.5 * sqrt(0.5)
         let expected = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
@@ -301,10 +340,61 @@ mod tests {
         t.playing = true;
         t.loop_region = LoopRegion::new(0, 100);
         t.position_frames = 80;
-        let mut l = vec![0.0; 64];
-        let mut r = vec![0.0; 64];
-        process(&mut t, &[], &mut l, &mut r);
+        let mut l = buf(64);
+        let mut r = buf(64);
+        let mut sl = buf(64);
+        let mut sr = buf(64);
+        let mut tracks: Vec<Track> = vec![];
+        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
         // 80 + 64 = 144; wrap to 44
         assert_eq!(t.position_frames, 44);
+    }
+
+    #[test]
+    fn fx_chain_processes_in_order() {
+        use crate::fx::delay::Delay;
+        use crate::fx::{FxId, FxNode};
+
+        // Two delays in series: 50-sample then 30-sample, each 100% wet,
+        // 0 feedback. An impulse at sample 0 should appear at sample 80.
+        let mut track = Track::new(TrackId(1));
+        let src = mono_source({
+            let mut v = vec![0.0; 500];
+            v[0] = 1.0;
+            v
+        });
+        track.add_clip(Clip {
+            id: ClipId(1),
+            source: src,
+            start_frame: 0,
+            length_frames: 500,
+            offset_in_source: 0,
+            gain: 1.0,
+        });
+        let mut d1 = Delay::new(48_000.0, 1.0);
+        d1.delay_samples = 50;
+        d1.wet = 1.0;
+        d1.dry = 0.0;
+        d1.feedback = 0.0;
+        let mut d2 = Delay::new(48_000.0, 1.0);
+        d2.delay_samples = 30;
+        d2.wet = 1.0;
+        d2.dry = 0.0;
+        d2.feedback = 0.0;
+        track.fx_chain.push(FxNode::Delay { id: FxId(1), fx: d1 });
+        track.fx_chain.push(FxNode::Delay { id: FxId(2), fx: d2 });
+
+        let mut t = Transport::new(48_000.0);
+        t.playing = true;
+        let mut l = buf(200);
+        let mut r = buf(200);
+        let mut sl = buf(200);
+        let mut sr = buf(200);
+        let mut tracks = vec![track];
+        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
+        // Peak should be near sample 80, well above the noise floor in
+        // surrounding samples.
+        assert!(l[80].abs() > 0.1, "expected a peak at 80, got {}", l[80]);
+        assert!(l[10].abs() < 1e-3);
     }
 }

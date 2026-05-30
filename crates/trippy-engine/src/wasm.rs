@@ -8,6 +8,9 @@
 use wasm_bindgen::prelude::*;
 
 use crate::engine::Engine;
+use crate::fx::biquad::BiquadKind;
+use crate::fx::eq::EqBand;
+use crate::fx::FxId;
 use crate::source::ChannelLayout;
 use crate::wav;
 
@@ -213,5 +216,90 @@ impl WasmEngine {
         }
         self.inner.process(out_l, out_r);
         Ok(())
+    }
+
+    // ----- FX inserts -----
+    //
+    // The JS-facing FX API is intentionally narrow at v1: one call per FX
+    // kind, returning a u32 fx id the caller can later pass to removeFx.
+    // No in-place parameter updates yet — to retune, removeFx + add again.
+
+    /// Add a single-band peak EQ at the given frequency. Returns fx id.
+    #[wasm_bindgen(js_name = addEq)]
+    pub fn add_eq(
+        &mut self,
+        track_id: u32,
+        freq_hz: f32,
+        q: f32,
+        gain_db: f32,
+        kind: &str,
+    ) -> Result<u32, JsError> {
+        let biquad_kind = match kind {
+            "peak" => BiquadKind::Peak,
+            "low_shelf" => BiquadKind::LowShelf,
+            "high_shelf" => BiquadKind::HighShelf,
+            "lowpass" => BiquadKind::Lowpass,
+            "highpass" => BiquadKind::Highpass,
+            other => return Err(JsError::new(&format!("unknown EQ kind: {other}"))),
+        };
+        let band = EqBand {
+            kind: biquad_kind,
+            freq: freq_hz.max(20.0).min(20_000.0),
+            q: if q.is_finite() && q > 0.0 { q } else { 1.0 },
+            gain_db,
+            enabled: true,
+        };
+        self.inner
+            .add_eq(crate::track::TrackId(track_id), vec![band])
+            .map(|id| id.0)
+            .ok_or_else(|| JsError::new("unknown track"))
+    }
+
+    /// Add a compressor. `attack_ms` and `release_ms` are clamped to the
+    /// compressor's valid range; `ratio` is clamped to ≥1.
+    #[wasm_bindgen(js_name = addCompressor)]
+    pub fn add_compressor(
+        &mut self,
+        track_id: u32,
+        threshold_db: f32,
+        ratio: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        makeup_db: f32,
+    ) -> Result<u32, JsError> {
+        self.inner
+            .add_compressor(
+                crate::track::TrackId(track_id),
+                threshold_db,
+                ratio,
+                attack_ms,
+                release_ms,
+                makeup_db,
+            )
+            .map(|id| id.0)
+            .ok_or_else(|| JsError::new("unknown track"))
+    }
+
+    /// Add a tempo-synced stereo delay. `beats` is the delay time in beats
+    /// at the engine's current BPM.
+    #[wasm_bindgen(js_name = addDelay)]
+    pub fn add_delay(
+        &mut self,
+        track_id: u32,
+        beats: f32,
+        feedback: f32,
+        wet: f32,
+        ping_pong: f32,
+    ) -> Result<u32, JsError> {
+        self.inner
+            .add_delay(crate::track::TrackId(track_id), beats, feedback, wet, ping_pong)
+            .map(|id| id.0)
+            .ok_or_else(|| JsError::new("unknown track"))
+    }
+
+    #[wasm_bindgen(js_name = removeFx)]
+    pub fn remove_fx(&mut self, track_id: u32, fx_id: u32) -> bool {
+        self.inner
+            .remove_fx(crate::track::TrackId(track_id), FxId(fx_id))
     }
 }

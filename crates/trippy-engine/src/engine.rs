@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::clip::{Clip, ClipId};
+use crate::fx::{compressor::Compressor, delay::Delay, eq::Eq, FxId, FxNode};
 use crate::graph;
 use crate::source::{AudioSource, ChannelLayout, SourceHandle, SourceId};
 use crate::track::{Track, TrackId};
@@ -17,9 +18,15 @@ pub struct Engine {
     pub transport: Transport,
     pub tracks: Vec<Track>,
     sources: HashMap<SourceId, SourceHandle>,
+    /// Per-track scratch buffers, lazily resized to the largest seen chunk.
+    /// Reused across all tracks per render, so the audio callback never
+    /// allocates after warmup.
+    scratch_l: Vec<f32>,
+    scratch_r: Vec<f32>,
     next_source_id: u32,
     next_track_id: u32,
     next_clip_id: u32,
+    next_fx_id: u32,
 }
 
 impl Engine {
@@ -28,9 +35,84 @@ impl Engine {
             transport: Transport::new(sample_rate),
             tracks: Vec::new(),
             sources: HashMap::new(),
+            scratch_l: Vec::new(),
+            scratch_r: Vec::new(),
             next_source_id: 1,
             next_track_id: 1,
             next_clip_id: 1,
+            next_fx_id: 1,
+        }
+    }
+
+    /// Add a multi-band EQ to a track. Returns the new FX id, or None if
+    /// the track doesn't exist.
+    pub fn add_eq(&mut self, track_id: TrackId, bands: Vec<crate::fx::eq::EqBand>) -> Option<FxId> {
+        let sr = self.transport.sample_rate;
+        let track = self.tracks.iter_mut().find(|t| t.id == track_id)?;
+        let id = FxId(self.next_fx_id);
+        self.next_fx_id += 1;
+        track
+            .fx_chain
+            .push(FxNode::Eq { id, fx: Eq::new(sr, bands) });
+        Some(id)
+    }
+
+    /// Add a compressor with the given params.
+    pub fn add_compressor(
+        &mut self,
+        track_id: TrackId,
+        threshold_db: f32,
+        ratio: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        makeup_db: f32,
+    ) -> Option<FxId> {
+        let sr = self.transport.sample_rate;
+        let track = self.tracks.iter_mut().find(|t| t.id == track_id)?;
+        let id = FxId(self.next_fx_id);
+        self.next_fx_id += 1;
+        let mut c = Compressor::new(sr);
+        c.threshold_db = threshold_db;
+        c.ratio = ratio.max(1.0);
+        c.set_attack_ms(attack_ms.clamp(0.1, 1000.0));
+        c.set_release_ms(release_ms.clamp(1.0, 5000.0));
+        c.makeup_db = makeup_db;
+        track.fx_chain.push(FxNode::Compressor { id, fx: c });
+        Some(id)
+    }
+
+    /// Add a tempo-synced stereo delay. `beats` is the delay time in beats
+    /// at the current BPM (0.25 = 1/16, 0.5 = 1/8, 1.0 = quarter, etc.).
+    pub fn add_delay(
+        &mut self,
+        track_id: TrackId,
+        beats: f32,
+        feedback: f32,
+        wet: f32,
+        ping_pong: f32,
+    ) -> Option<FxId> {
+        let sr = self.transport.sample_rate;
+        let bpm = self.transport.bpm.0 as f32;
+        let track = self.tracks.iter_mut().find(|t| t.id == track_id)?;
+        let id = FxId(self.next_fx_id);
+        self.next_fx_id += 1;
+        let mut d = Delay::new(sr, 4.0);
+        d.set_time_beats(beats.max(0.001), bpm);
+        d.feedback = feedback.clamp(0.0, 0.95);
+        d.wet = wet.clamp(0.0, 1.0);
+        d.dry = 1.0 - wet.clamp(0.0, 1.0) * 0.5;
+        d.ping_pong = ping_pong.clamp(0.0, 1.0);
+        track.fx_chain.push(FxNode::Delay { id, fx: d });
+        Some(id)
+    }
+
+    pub fn remove_fx(&mut self, track_id: TrackId, fx_id: FxId) -> bool {
+        if let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) {
+            let before = track.fx_chain.len();
+            track.fx_chain.retain(|f| f.id() != fx_id);
+            track.fx_chain.len() != before
+        } else {
+            false
         }
     }
 
@@ -155,7 +237,19 @@ impl Engine {
 
     /// Render the next `out_l.len()` frames. `out_r.len()` must equal `out_l.len()`.
     pub fn process(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
-        graph::process(&mut self.transport, &self.tracks, out_l, out_r);
+        let frames = out_l.len();
+        if self.scratch_l.len() < frames {
+            self.scratch_l.resize(frames, 0.0);
+            self.scratch_r.resize(frames, 0.0);
+        }
+        graph::process(
+            &mut self.transport,
+            &mut self.tracks,
+            &mut self.scratch_l,
+            &mut self.scratch_r,
+            out_l,
+            out_r,
+        );
     }
 }
 

@@ -38,7 +38,36 @@ export type EngineCommand =
   | { type: "setTrackSolo"; trackId: number; solo: boolean }
   | { type: "removeClip"; trackId: number; clipId: number }
   | { type: "removeTrack"; trackId: number }
-  | { type: "renderOffline"; frameCount: number; requestId: number };
+  | { type: "renderOffline"; frameCount: number; requestId: number }
+  | {
+      type: "addEq";
+      trackId: number;
+      freq: number;
+      q: number;
+      gainDb: number;
+      kind: string;
+      requestId: number;
+    }
+  | {
+      type: "addCompressor";
+      trackId: number;
+      thresholdDb: number;
+      ratio: number;
+      attackMs: number;
+      releaseMs: number;
+      makeupDb: number;
+      requestId: number;
+    }
+  | {
+      type: "addDelay";
+      trackId: number;
+      beats: number;
+      feedback: number;
+      wet: number;
+      pingPong: number;
+      requestId: number;
+    }
+  | { type: "removeFx"; trackId: number; fxId: number };
 
 // Events emitted back to the main thread.
 export type EngineEvent =
@@ -60,6 +89,7 @@ export type EngineEvent =
       sampleRate: number;
       frameCount: number;
     }
+  | { type: "fxAdded"; requestId: number; fxId: number }
   | { type: "error"; message: string; requestId?: number }
   | { type: "position"; frame: number; playing: boolean };
 
@@ -286,6 +316,37 @@ self.onmessage = async (e: MessageEvent<EngineCommand>) => {
         break;
       case "renderOffline":
         renderOffline(cmd.frameCount, cmd.requestId);
+        break;
+      case "addEq": {
+        const fxId = engine.addEq(cmd.trackId, cmd.freq, cmd.q, cmd.gainDb, cmd.kind);
+        emit({ type: "fxAdded", requestId: cmd.requestId, fxId });
+        break;
+      }
+      case "addCompressor": {
+        const fxId = engine.addCompressor(
+          cmd.trackId,
+          cmd.thresholdDb,
+          cmd.ratio,
+          cmd.attackMs,
+          cmd.releaseMs,
+          cmd.makeupDb,
+        );
+        emit({ type: "fxAdded", requestId: cmd.requestId, fxId });
+        break;
+      }
+      case "addDelay": {
+        const fxId = engine.addDelay(
+          cmd.trackId,
+          cmd.beats,
+          cmd.feedback,
+          cmd.wet,
+          cmd.pingPong,
+        );
+        emit({ type: "fxAdded", requestId: cmd.requestId, fxId });
+        break;
+      }
+      case "removeFx":
+        engine.removeFx(cmd.trackId, cmd.fxId);
         break;
     }
   } catch (err) {

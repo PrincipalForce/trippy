@@ -905,9 +905,46 @@ export function App() {
                 if (eid != null) controller.setTrackPan(eid, c.pan);
                 break;
               }
-              // EQ / compressor / delay / sidechain: no engine plumbing yet.
-              // AiPanel labels these "engine-pending" so the user sees the
-              // intent without us silently no-op'ing them.
+              case "addEq": {
+                const eid = engineTrackIds.get(c.trackId);
+                if (eid == null) break;
+                // The LLM's "kind" parameter is opaque from the engine's
+                // perspective until we expand the schema; default to peak.
+                void controller.addEq({
+                  trackId: eid,
+                  freq: c.freq,
+                  q: c.q,
+                  gainDb: c.gainDb,
+                  kind: "peak",
+                });
+                break;
+              }
+              case "addCompressor": {
+                const eid = engineTrackIds.get(c.trackId);
+                if (eid == null) break;
+                void controller.addCompressor({
+                  trackId: eid,
+                  thresholdDb: c.thresholdDb,
+                  ratio: c.ratio,
+                  attackMs: 10,
+                  releaseMs: 100,
+                  makeupDb: 0,
+                });
+                break;
+              }
+              case "addDelay": {
+                const eid = engineTrackIds.get(c.trackId);
+                if (eid == null) break;
+                void controller.addDelay({
+                  trackId: eid,
+                  beats: c.beats,
+                  feedback: c.feedback,
+                  wet: c.wet,
+                  pingPong: 0,
+                });
+                break;
+              }
+              // Sidechain still needs cross-track signal routing in the engine.
               default:
                 break;
             }

@@ -4,11 +4,12 @@
 //! arrive in M4.
 
 use crate::clip::{Clip, ClipId};
+use crate::fx::FxNode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TrackId(pub u32);
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Track {
     pub id: TrackId,
     pub clips: Vec<Clip>,
@@ -18,6 +19,8 @@ pub struct Track {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
+    /// Post-clip-mix, pre-pan/gain insert chain. Processed in order.
+    pub fx_chain: Vec<FxNode>,
 }
 
 impl Track {
@@ -29,6 +32,7 @@ impl Track {
             pan: 0.0,
             mute: false,
             solo: false,
+            fx_chain: Vec::new(),
         }
     }
 

@@ -173,6 +173,74 @@ export class AudioController {
     this.worker.postMessage({ type: "removeTrack", trackId } satisfies EngineCommand);
   }
 
+  // ----- FX inserts -----
+  //
+  // Each helper waits for the worker to ACK with the assigned fx id so the
+  // caller can later remove the FX without bookkeeping per-call ids itself.
+
+  async addEq(opts: {
+    trackId: number;
+    freq: number;
+    q: number;
+    gainDb: number;
+    kind: "peak" | "low_shelf" | "high_shelf" | "lowpass" | "highpass";
+  }): Promise<number> {
+    const ev = await this.request<Extract<EngineEvent, { type: "fxAdded" }>>((id) => ({
+      type: "addEq",
+      trackId: opts.trackId,
+      freq: opts.freq,
+      q: opts.q,
+      gainDb: opts.gainDb,
+      kind: opts.kind,
+      requestId: id,
+    }));
+    return ev.fxId;
+  }
+
+  async addCompressor(opts: {
+    trackId: number;
+    thresholdDb: number;
+    ratio: number;
+    attackMs: number;
+    releaseMs: number;
+    makeupDb: number;
+  }): Promise<number> {
+    const ev = await this.request<Extract<EngineEvent, { type: "fxAdded" }>>((id) => ({
+      type: "addCompressor",
+      trackId: opts.trackId,
+      thresholdDb: opts.thresholdDb,
+      ratio: opts.ratio,
+      attackMs: opts.attackMs,
+      releaseMs: opts.releaseMs,
+      makeupDb: opts.makeupDb,
+      requestId: id,
+    }));
+    return ev.fxId;
+  }
+
+  async addDelay(opts: {
+    trackId: number;
+    beats: number;
+    feedback: number;
+    wet: number;
+    pingPong: number;
+  }): Promise<number> {
+    const ev = await this.request<Extract<EngineEvent, { type: "fxAdded" }>>((id) => ({
+      type: "addDelay",
+      trackId: opts.trackId,
+      beats: opts.beats,
+      feedback: opts.feedback,
+      wet: opts.wet,
+      pingPong: opts.pingPong,
+      requestId: id,
+    }));
+    return ev.fxId;
+  }
+
+  removeFx(trackId: number, fxId: number) {
+    this.worker.postMessage({ type: "removeFx", trackId, fxId } satisfies EngineCommand);
+  }
+
   /** Render `frameCount` frames straight-through into a stereo-interleaved
    *  Float32Array. Pauses realtime playback for the duration of the render
    *  and restores transport position afterward. */
