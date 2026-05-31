@@ -11,6 +11,7 @@ import { AiPanel } from "./ai/AiPanel";
 import { RecordButton } from "./RecordButton";
 import { ModeBar, type EditMode } from "./ModeBar";
 import { Inspector } from "./Inspector";
+import { useWakeLock } from "./use-wake-lock";
 import type { FxEntry } from "../audio/fx-state";
 import { opfsAvailable, saveProject, loadProject, listProjects } from "../project/opfs";
 
@@ -101,6 +102,9 @@ export function App() {
   });
 
   const controller = getController();
+  // Keep the phone display on while the app is open. The OS sleeps the
+  // screen after the touch-inactivity timeout otherwise, even mid-playback.
+  const wakeLock = useWakeLock();
 
   onMount(() => {
     const unsub = controller.onTransportChange((s) => {
@@ -796,6 +800,19 @@ export function App() {
         </Show>
         <Show when={project.state.dirty}>
           <span style={{ color: "#ffb86b", "font-size": "0.8rem" }}>● unsaved</span>
+        </Show>
+        <Show when={wakeLock.active()}>
+          <span
+            title="Screen wake lock active — display stays on while the app is open"
+            aria-label="Wake lock active"
+            style={{
+              color: "#88d977",
+              "font-size": "0.78rem",
+              "letter-spacing": "0.02em",
+            }}
+          >
+            ☀ awake
+          </span>
         </Show>
       </header>
 
