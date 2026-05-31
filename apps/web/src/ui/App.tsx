@@ -3,6 +3,7 @@ import { getController } from "../audio/controller";
 import { decodeAudio } from "../audio/decode";
 import { encodeWavPcm16 } from "../audio/wav-encode";
 import { detectTempo } from "../ai/tempo";
+import { splitIntoFrequencyBands } from "../ai/stems";
 import { buildWaveform, type Waveform } from "../audio/waveform-cache";
 import { createProjectStore } from "../project/store";
 import { Timeline, type ClipRef, type ClipPatch } from "./timeline/Timeline";
@@ -500,6 +501,84 @@ export function App() {
     setInspectorOpen(false);
   }
 
+  // Split the currently-selected clip into 4 frequency-band tracks.
+  // Each band becomes its own track + source + clip, scheduled at the same
+  // start frame as the original so they all sum back to (approximately) the
+  // input on playback. The original is left in place; the user can mute it
+  // to audition the split, or delete it to keep only the bands.
+  async function splitSelectedClipBands() {
+    const sel = selectedClip();
+    if (!sel) return;
+    const t = project.state.project.tracks.find((tr) => tr.id === sel.trackId);
+    const clip = t?.clips.find((c) => c.id === sel.clipId);
+    if (!t || !clip) return;
+    const bytes = sourceBytes.get(clip.sourceId);
+    if (!bytes) {
+      setError("Source audio not in memory — try reloading the clip.");
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    try {
+      const decoded = await decodeAudio(bytes);
+      const bands = await splitIntoFrequencyBands(decoded.channels, decoded.sampleRate);
+      // Color cycle so the four new tracks are visually distinct.
+      const colors = ["#7c5cff", "#5cff8c", "#ffd45c", "#5cdcff"];
+      const baseName = clip.label ?? t.name;
+      for (let i = 0; i < bands.length; i++) {
+        const b = bands[i]!;
+        const wav = encodeWavPcm16(b.channels, decoded.sampleRate);
+        const engineSrc = await controller.loadWav(wav);
+
+        const projSourceId =
+          (project.state.project.sources.at(-1)?.id ?? 0) + 1;
+        project.addSource({
+          id: projSourceId,
+          file: `src-${projSourceId}.wav`,
+          sampleRate: engineSrc.sampleRate,
+          channels: engineSrc.channels,
+          frameCount: engineSrc.frameCount,
+          originalName: `${baseName} · ${b.config.label}`,
+        });
+        engineSourceIds.set(projSourceId, engineSrc.sourceId);
+        sourceBytes.set(projSourceId, wav);
+        setWaveforms((m) => {
+          const next = new Map(m);
+          next.set(projSourceId, buildWaveform(b.channels, decoded.sampleRate));
+          return next;
+        });
+
+        const projTrackId = project.addTrack(`${baseName} · ${b.config.label}`);
+        project.updateTrack(projTrackId, { color: colors[i % colors.length] });
+        const engineTrackId = await controller.addTrack();
+        engineTrackIds.set(projTrackId, engineTrackId);
+
+        const newClipId = project.addClip(projTrackId, {
+          sourceId: projSourceId,
+          startFrame: clip.startFrame,
+          lengthFrames: clip.lengthFrames,
+          offsetInSource: 0,
+          gain: 1,
+          label: `${baseName} · ${b.config.label}`,
+        });
+        if (newClipId != null) {
+          const eid = await controller.addClip({
+            trackId: engineTrackId,
+            sourceId: engineSrc.sourceId,
+            startFrame: clip.startFrame,
+            lengthFrames: clip.lengthFrames,
+            offsetInSource: 0,
+          });
+          engineClipIds.set(newClipId, eid);
+        }
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // Render the project to a downloadable WAV. Bounds the render to the last
   // clip's end frame so we don't burn cycles on empty tail.
   async function exportProject() {
@@ -898,6 +977,7 @@ export function App() {
           if (s) deleteClip(s);
         }}
         onClipSplitAtPlayhead={splitSelectedAtPlayhead}
+        onClipSplitBands={() => void splitSelectedClipBands()}
         onClipRename={(label) => {
           const s = selectedClip();
           if (s) renameClip(s, label);

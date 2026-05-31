@@ -24,6 +24,8 @@ export interface InspectorProps {
   onClipDuplicate?: () => void;
   onClipDelete?: () => void;
   onClipSplitAtPlayhead?: () => void;
+  /** Frequency-band split the clip into bass/low-mid/high-mid/high tracks. */
+  onClipSplitBands?: () => void;
   onClipRename?: (label: string) => void;
   // track actions
   onTrackRename?: (name: string) => void;
@@ -86,6 +88,7 @@ export function Inspector(props: InspectorProps) {
               onDuplicate={props.onClipDuplicate}
               onDelete={props.onClipDelete}
               onSplitAtPlayhead={props.onClipSplitAtPlayhead}
+              onSplitBands={props.onClipSplitBands}
               onRename={props.onClipRename}
             />
           )}
@@ -116,6 +119,7 @@ function ClipInspector(props: {
   onDuplicate?: () => void;
   onDelete?: () => void;
   onSplitAtPlayhead?: () => void;
+  onSplitBands?: () => void;
   onRename?: (label: string) => void;
 }) {
   function fmtSecs(frames: number): string {
@@ -182,6 +186,13 @@ function ClipInspector(props: {
       <div style={{ display: "flex", gap: "0.4rem", "flex-wrap": "wrap" }}>
         <button type="button" onClick={() => props.onSplitAtPlayhead?.()}>
           ✂ Split @ playhead
+        </button>
+        <button
+          type="button"
+          onClick={() => props.onSplitBands?.()}
+          title="Split into bass / low-mid / high-mid / high tracks"
+        >
+          ≡ Split bands
         </button>
         <button type="button" onClick={() => props.onDuplicate?.()}>
           ⎘ Duplicate
