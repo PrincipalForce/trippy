@@ -6,8 +6,9 @@
 // still lives at the bottom for muscle-memory consistency with the
 // transport / mixer rail.
 
-import { Show } from "solid-js";
+import { For, Show } from "solid-js";
 import type { ClipSnapshot, TrackSnapshot } from "@trippy/format";
+import type { FxEntry } from "../audio/fx-state";
 
 const TRACK_COLORS = [
   "#7c5cff", "#ff8c5c", "#5cff8c", "#ffd45c", "#5cdcff",
@@ -28,6 +29,10 @@ export interface InspectorProps {
   onTrackRename?: (name: string) => void;
   onTrackColor?: (color: string) => void;
   onTrackDelete?: () => void;
+  /** FX chain on the currently-selected track. */
+  trackFx?: FxEntry[];
+  /** Remove a specific FX from the selected track. */
+  onRemoveFx?: (fxId: number) => void;
   // shell
   onClose?: () => void;
 }
@@ -90,9 +95,11 @@ export function Inspector(props: InspectorProps) {
           {(t) => (
             <TrackInspector
               track={t()}
+              fx={props.trackFx ?? []}
               onRename={props.onTrackRename}
               onColor={props.onTrackColor}
               onDelete={props.onTrackDelete}
+              onRemoveFx={props.onRemoveFx}
             />
           )}
         </Show>
@@ -193,10 +200,14 @@ function ClipInspector(props: {
 
 function TrackInspector(props: {
   track: TrackSnapshot;
+  fx: FxEntry[];
   onRename?: (name: string) => void;
   onColor?: (color: string) => void;
   onDelete?: () => void;
+  onRemoveFx?: (fxId: number) => void;
 }) {
+  const glyph = (kind: FxEntry["kind"]) =>
+    kind === "eq" ? "≈" : kind === "compressor" ? "▼" : "↻";
   return (
     <>
       <div style={{ display: "flex", gap: "0.4rem", "align-items": "center", "flex-wrap": "wrap" }}>
@@ -241,6 +252,49 @@ function TrackInspector(props: {
           ))}
         </div>
       </div>
+      <Show when={props.fx.length > 0}>
+        <div style={{ display: "flex", "flex-direction": "column", gap: "0.25rem" }}>
+          <span style={{ color: "var(--fg-dim)", "font-size": "0.75rem", "text-transform": "uppercase", "letter-spacing": "0.05em" }}>
+            FX chain
+          </span>
+          <For each={props.fx}>
+            {(f) => (
+              <div
+                style={{
+                  display: "flex",
+                  "align-items": "center",
+                  gap: "0.5rem",
+                  padding: "0.35rem 0.55rem",
+                  background: "var(--bg)",
+                  border: "1px solid var(--grid)",
+                  "border-radius": "6px",
+                }}
+              >
+                <span style={{ "font-size": "0.95rem", width: "1.2rem", "text-align": "center" }}>
+                  {glyph(f.kind)}
+                </span>
+                <span style={{ flex: 1, "font-size": "0.82rem", "min-width": 0, overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+                  {f.label}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => props.onRemoveFx?.(f.fxId)}
+                  title="Remove this FX"
+                  style={{
+                    "min-width": "32px",
+                    "min-height": "30px",
+                    padding: "0 0.4rem",
+                    "border-color": "#ff4d6d",
+                    color: "#ffb8c5",
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
       <div style={{ display: "flex", gap: "0.4rem" }}>
         <button
           type="button"

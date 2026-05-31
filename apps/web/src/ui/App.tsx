@@ -10,6 +10,7 @@ import { AiPanel } from "./ai/AiPanel";
 import { RecordButton } from "./RecordButton";
 import { ModeBar, type EditMode } from "./ModeBar";
 import { Inspector } from "./Inspector";
+import type { FxEntry } from "../audio/fx-state";
 import { opfsAvailable, saveProject, loadProject, listProjects } from "../project/opfs";
 
 export function App() {
@@ -52,6 +53,27 @@ export function App() {
   // when the user taps the small "details" pill. This keeps the touch zone
   // clear during routine moves.
   const [inspectorOpen, setInspectorOpen] = createSignal(false);
+  // projTrackId -> FX list. Session-only; not persisted to the project file
+  // until TrackSnapshot.fx_chain lands in the schema.
+  const [trackFx, setTrackFx] = createSignal<Map<number, FxEntry[]>>(new Map());
+
+  function recordFx(projTrackId: number, entry: FxEntry) {
+    setTrackFx((prev) => {
+      const next = new Map(prev);
+      next.set(projTrackId, [...(next.get(projTrackId) ?? []), entry]);
+      return next;
+    });
+  }
+  function removeFxEntry(projTrackId: number, fxId: number) {
+    const eTrack = engineTrackIds.get(projTrackId);
+    if (eTrack != null) controller.removeFx(eTrack, fxId);
+    setTrackFx((prev) => {
+      const next = new Map(prev);
+      const list = next.get(projTrackId);
+      if (list) next.set(projTrackId, list.filter((f) => f.fxId !== fxId));
+      return next;
+    });
+  }
   // A pending tempo suggestion surfaced after a clip is imported with a
   // confident BPM estimate. User can adopt or dismiss.
   const [tempoSuggestion, setTempoSuggestion] = createSignal<
@@ -244,6 +266,7 @@ export function App() {
       engineTrackIds.clear();
       engineClipIds.clear();
       setSelectedClip(null);
+      setTrackFx(new Map());
       const newWf = new Map<number, Waveform>();
       // Re-push all sources to engine + rebuild waveforms
       for (const src of proj.sources) {
@@ -466,6 +489,12 @@ export function App() {
     if (eTrack != null) controller.removeTrack(eTrack);
     engineTrackIds.delete(trackId);
     project.removeTrack(trackId);
+    setTrackFx((prev) => {
+      if (!prev.has(trackId)) return prev;
+      const next = new Map(prev);
+      next.delete(trackId);
+      return next;
+    });
     setSelectedTrack(null);
     setSelectedClip(null);
     setInspectorOpen(false);
@@ -851,6 +880,11 @@ export function App() {
         selectedClip={selectedClipDetail()}
         selectedTrack={selectedTrackSnap()}
         sampleRate={project.state.project.transport.sampleRate}
+        trackFx={selectedTrack() != null ? trackFx().get(selectedTrack()!) : undefined}
+        onRemoveFx={(fxId) => {
+          const id = selectedTrack();
+          if (id != null) removeFxEntry(id, fxId);
+        }}
         onClipGain={(g) => {
           const s = selectedClip();
           if (s) setClipGain(s, g);
@@ -886,13 +920,12 @@ export function App() {
 
       <AiPanel
         project={project.state.project}
-        onApply={(commands) => {
+        onApply={async (commands) => {
           for (const c of commands) {
             switch (c.type) {
               case "setTrackGain": {
                 const t = project.state.project.tracks.find((tr) => tr.id === c.trackId);
                 if (!t) break;
-                // The schema sends delta_db; convert to absolute linear gain.
                 const newLinear = Math.max(0, t.gain * Math.pow(10, c.gain / 20));
                 project.updateTrack(c.trackId, { gain: newLinear });
                 const eid = engineTrackIds.get(c.trackId);
@@ -908,21 +941,24 @@ export function App() {
               case "addEq": {
                 const eid = engineTrackIds.get(c.trackId);
                 if (eid == null) break;
-                // The LLM's "kind" parameter is opaque from the engine's
-                // perspective until we expand the schema; default to peak.
-                void controller.addEq({
+                const fxId = await controller.addEq({
                   trackId: eid,
                   freq: c.freq,
                   q: c.q,
                   gainDb: c.gainDb,
                   kind: "peak",
                 });
+                recordFx(c.trackId, {
+                  kind: "eq",
+                  fxId,
+                  label: `EQ @ ${Math.round(c.freq)} Hz ${c.gainDb >= 0 ? "+" : ""}${c.gainDb.toFixed(1)} dB`,
+                });
                 break;
               }
               case "addCompressor": {
                 const eid = engineTrackIds.get(c.trackId);
                 if (eid == null) break;
-                void controller.addCompressor({
+                const fxId = await controller.addCompressor({
                   trackId: eid,
                   thresholdDb: c.thresholdDb,
                   ratio: c.ratio,
@@ -930,17 +966,27 @@ export function App() {
                   releaseMs: 100,
                   makeupDb: 0,
                 });
+                recordFx(c.trackId, {
+                  kind: "compressor",
+                  fxId,
+                  label: `Compressor ${c.thresholdDb.toFixed(0)} dB / ${c.ratio.toFixed(1)}:1`,
+                });
                 break;
               }
               case "addDelay": {
                 const eid = engineTrackIds.get(c.trackId);
                 if (eid == null) break;
-                void controller.addDelay({
+                const fxId = await controller.addDelay({
                   trackId: eid,
                   beats: c.beats,
                   feedback: c.feedback,
                   wet: c.wet,
                   pingPong: 0,
+                });
+                recordFx(c.trackId, {
+                  kind: "delay",
+                  fxId,
+                  label: `Delay ${c.beats} beat · ${Math.round(c.wet * 100)}% wet`,
                 });
                 break;
               }
@@ -948,11 +994,7 @@ export function App() {
                 const target = engineTrackIds.get(c.to);
                 const source = engineTrackIds.get(c.from);
                 if (target == null || source == null) break;
-                // The LLM's sidechain tool doesn't pass compressor params, so
-                // we default to a snappy "pumping" profile: fast attack,
-                // medium release, hot threshold, 6:1 ratio. Users can later
-                // tune via a removeFx + a fresh add_compressor.
-                void controller.addSidechainCompressor({
+                const fxId = await controller.addSidechainCompressor({
                   targetTrackId: target,
                   sourceTrackId: source,
                   thresholdDb: -20,
@@ -960,6 +1002,14 @@ export function App() {
                   attackMs: 1,
                   releaseMs: 100,
                   makeupDb: 0,
+                });
+                const fromName =
+                  project.state.project.tracks.find((t) => t.id === c.from)?.name ?? `track ${c.from}`;
+                recordFx(c.to, {
+                  kind: "compressor",
+                  fxId,
+                  sidechainFromProjTrackId: c.from,
+                  label: `Sidechain ← ${fromName}`,
                 });
                 break;
               }
