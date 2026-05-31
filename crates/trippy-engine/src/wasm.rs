@@ -297,6 +297,33 @@ impl WasmEngine {
             .ok_or_else(|| JsError::new("unknown track"))
     }
 
+    /// Add a compressor on `target_track_id` whose detector reads from
+    /// `source_track_id` (sidechain). Returns the new fx id.
+    #[wasm_bindgen(js_name = addSidechainCompressor)]
+    pub fn add_sidechain_compressor(
+        &mut self,
+        target_track_id: u32,
+        source_track_id: u32,
+        threshold_db: f32,
+        ratio: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        makeup_db: f32,
+    ) -> Result<u32, JsError> {
+        self.inner
+            .add_sidechain_compressor(
+                crate::track::TrackId(target_track_id),
+                crate::track::TrackId(source_track_id),
+                threshold_db,
+                ratio,
+                attack_ms,
+                release_ms,
+                makeup_db,
+            )
+            .map(|id| id.0)
+            .ok_or_else(|| JsError::new("unknown target or source track"))
+    }
+
     #[wasm_bindgen(js_name = removeFx)]
     pub fn remove_fx(&mut self, track_id: u32, fx_id: u32) -> bool {
         self.inner

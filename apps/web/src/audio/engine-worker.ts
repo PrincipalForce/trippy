@@ -67,7 +67,18 @@ export type EngineCommand =
       pingPong: number;
       requestId: number;
     }
-  | { type: "removeFx"; trackId: number; fxId: number };
+  | { type: "removeFx"; trackId: number; fxId: number }
+  | {
+      type: "addSidechainCompressor";
+      targetTrackId: number;
+      sourceTrackId: number;
+      thresholdDb: number;
+      ratio: number;
+      attackMs: number;
+      releaseMs: number;
+      makeupDb: number;
+      requestId: number;
+    };
 
 // Events emitted back to the main thread.
 export type EngineEvent =
@@ -348,6 +359,19 @@ self.onmessage = async (e: MessageEvent<EngineCommand>) => {
       case "removeFx":
         engine.removeFx(cmd.trackId, cmd.fxId);
         break;
+      case "addSidechainCompressor": {
+        const fxId = engine.addSidechainCompressor(
+          cmd.targetTrackId,
+          cmd.sourceTrackId,
+          cmd.thresholdDb,
+          cmd.ratio,
+          cmd.attackMs,
+          cmd.releaseMs,
+          cmd.makeupDb,
+        );
+        emit({ type: "fxAdded", requestId: cmd.requestId, fxId });
+        break;
+      }
     }
   } catch (err) {
     emit({

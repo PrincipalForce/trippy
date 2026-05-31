@@ -78,11 +78,48 @@ impl Compressor {
 
 impl Fx for Compressor {
     fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
+        self.process_internal(l, r, None);
+    }
+
+    fn reset(&mut self) {
+        self.env_db = -100.0;
+    }
+}
+
+impl Compressor {
+    /// Sidechain entry point: derive the envelope from `det_l`/`det_r` (the
+    /// "trigger" signal — e.g. a kick) while applying gain reduction to the
+    /// `l`/`r` target (e.g. a bass). Detector and target must have equal len.
+    ///
+    /// Same DSP otherwise — peak detector + soft-knee static curve +
+    /// attack/release-smoothed envelope.
+    pub fn process_with_detector(
+        &mut self,
+        l: &mut [f32],
+        r: &mut [f32],
+        det_l: &[f32],
+        det_r: &[f32],
+    ) {
+        debug_assert_eq!(l.len(), r.len());
+        debug_assert_eq!(l.len(), det_l.len());
+        debug_assert_eq!(l.len(), det_r.len());
+        self.process_internal(l, r, Some((det_l, det_r)));
+    }
+
+    fn process_internal(
+        &mut self,
+        l: &mut [f32],
+        r: &mut [f32],
+        detector: Option<(&[f32], &[f32])>,
+    ) {
         let makeup_lin = 10f32.powf(self.makeup_db / 20.0);
         for i in 0..l.len() {
-            let peak = l[i].abs().max(r[i].abs()).max(1e-10);
+            let (dl, dr) = match detector {
+                Some((dl, dr)) => (dl[i], dr[i]),
+                None => (l[i], r[i]),
+            };
+            let peak = dl.abs().max(dr.abs()).max(1e-10);
             let in_db = 20.0 * peak.log10();
-            // Smooth envelope: attack when input > env, release when below.
             let coef = if in_db > self.env_db {
                 self.attack_coef
             } else {
@@ -94,10 +131,6 @@ impl Fx for Compressor {
             l[i] *= g;
             r[i] *= g;
         }
-    }
-
-    fn reset(&mut self) {
-        self.env_db = -100.0;
     }
 }
 
@@ -117,6 +150,31 @@ mod tests {
         c.process(&mut l, &mut r);
         // Far below threshold; gain reduction should be ~0.
         assert!((l[999] - 0.05).abs() < 0.01);
+    }
+
+    #[test]
+    fn sidechain_quiet_target_gets_ducked_by_loud_trigger() {
+        // The classic kick→bass duck. Target is a quiet steady tone, trigger
+        // is a loud burst — target output should drop during the burst even
+        // though it never crosses threshold on its own.
+        let sr = 48_000.0;
+        let mut c = Compressor::new(sr);
+        c.threshold_db = -20.0;
+        c.ratio = 6.0;
+        c.set_attack_ms(1.0); // must use setter to recompute coefficients
+        c.set_release_ms(100.0);
+        let n = 4_800;
+        let mut tgt_l = vec![0.05; n]; // ≈ -26 dBFS, below threshold
+        let mut tgt_r = tgt_l.clone();
+        let det_l: Vec<f32> = (0..n).map(|i| if i < n / 2 { 0.8 } else { 0.0 }).collect();
+        let det_r = det_l.clone();
+        c.process_with_detector(&mut tgt_l, &mut tgt_r, &det_l, &det_r);
+        // First half (loud trigger) ducks target.
+        let early: f32 = (tgt_l[200..600].iter().map(|s| s.abs()).sum::<f32>()) / 400.0;
+        // Second half (silent trigger) recovers.
+        let late: f32 = (tgt_l[n - 400..n].iter().map(|s| s.abs()).sum::<f32>()) / 400.0;
+        assert!(early < 0.04, "expected duck, got {early}");
+        assert!(late > 0.045, "expected recovery, got {late}");
     }
 
     #[test]

@@ -1,16 +1,23 @@
 //! Engine processing graph: tracks → mixer → master out.
 //!
-//! Per-track flow:
+//! Two-pass render to support cross-track sidechain:
 //!
 //! ```text
-//!   clips ──► sum into scratch ──► FX chain (in order) ──► pan/gain ──► master sum
+//! Pass 1 (per track):  clips ──► sum into per-track tap (L/R)
+//! Pass 2 (per track):  tap ──► copy to scratch ──► FX chain ──► pan/gain
+//!                                                ▲                ▼
+//!                                     sidechain  │            master sum
+//!                                     reads from │
+//!                                     other tracks' taps
 //! ```
 //!
-//! Scratch buffers are owned by the caller (the engine) so the audio callback
-//! itself never allocates. They grow lazily to the largest seen chunk size.
+//! All buffers — per-track taps, the working scratch, and the id-index
+//! lookup — are owned by the engine so the audio callback itself never
+//! allocates. They grow lazily to the largest seen chunk + track count.
 
 use crate::clip::Clip;
-use crate::track::Track;
+use crate::fx::{AuxInput, FxNode};
+use crate::track::{Track, TrackId};
 use crate::transport::Transport;
 
 /// Per-process-call context passed to every node.
@@ -23,18 +30,18 @@ pub struct ProcessContext {
     pub playing: bool,
 }
 
-/// Render `frames` of stereo audio from the given tracks into `out_l`/`out_r`,
-/// starting at project-frame `ctx.start_frame`.
+/// Render `frames` of stereo audio. See module docs for the two-pass model.
 ///
-/// Scratch buffers (`scratch_l`/`scratch_r`) are reused across tracks — the
-/// engine owns them so the audio callback itself never allocates. They must
-/// be at least `ctx.frames` long.
-///
-/// The output buffers are *overwritten*, not added to. Callers wanting to mix
-/// into existing audio should sum afterward.
+/// `taps_l`/`taps_r` must each have `tracks.len()` entries; each entry must
+/// be at least `ctx.frames` long. `id_index` maps TrackId → index-into-tracks
+/// and must reflect the current tracks slice. Sized + populated by the
+/// engine before each call.
 pub fn render_master(
     ctx: ProcessContext,
     tracks: &mut [Track],
+    taps_l: &mut [Vec<f32>],
+    taps_r: &mut [Vec<f32>],
+    id_index: &[(TrackId, usize)],
     scratch_l: &mut [f32],
     scratch_r: &mut [f32],
     out_l: &mut [f32],
@@ -42,6 +49,8 @@ pub fn render_master(
 ) {
     debug_assert_eq!(out_l.len(), ctx.frames);
     debug_assert_eq!(out_r.len(), ctx.frames);
+    debug_assert_eq!(taps_l.len(), tracks.len());
+    debug_assert_eq!(taps_r.len(), tracks.len());
     debug_assert!(scratch_l.len() >= ctx.frames);
     debug_assert!(scratch_r.len() >= ctx.frames);
 
@@ -52,39 +61,67 @@ pub fn render_master(
         return;
     }
 
+    let n = tracks.len();
+    let frames = ctx.frames;
+
+    // ─── Pass 1: clip-mix every track into its tap. We tap signal regardless
+    // of mute/solo so a muted trigger track still drives downstream sidechain
+    // compressors (and so cross-track relationships keep working when soloing
+    // for A/B).
+    for i in 0..n {
+        let tap_l = &mut taps_l[i][..frames];
+        let tap_r = &mut taps_r[i][..frames];
+        tap_l.fill(0.0);
+        tap_r.fill(0.0);
+        for clip in &tracks[i].clips {
+            mix_clip_into_scratch(ctx, clip, tap_l, tap_r);
+        }
+    }
+
     let any_solo = tracks.iter().any(|t| t.solo);
 
-    for track in tracks.iter_mut() {
-        if track.mute {
+    // ─── Pass 2: copy each track's tap to scratch, run FX (with sidechain
+    // lookups against the other tracks' taps), apply pan/gain, sum to master.
+    for i in 0..n {
+        let (mute, solo) = (tracks[i].mute, tracks[i].solo);
+        if mute || (any_solo && !solo) {
             continue;
         }
-        if any_solo && !track.solo {
-            continue;
-        }
+        scratch_l[..frames].copy_from_slice(&taps_l[i][..frames]);
+        scratch_r[..frames].copy_from_slice(&taps_r[i][..frames]);
 
-        // 1. Sum all of this track's clips, pre-pan/gain/FX, into the scratch
-        //    stereo buses. Mono sources duplicate to both; stereo sources go
-        //    straight through. Clip gain is applied here.
-        let s_l = &mut scratch_l[..ctx.frames];
-        let s_r = &mut scratch_r[..ctx.frames];
-        s_l.fill(0.0);
-        s_r.fill(0.0);
-        for clip in &track.clips {
-            mix_clip_into_scratch(ctx, clip, s_l, s_r);
-        }
-
-        // 2. Run FX chain in-place on the scratch buses.
+        // Split tracks so we can hold &mut tracks[i] for FX state mutation
+        // while still reading other tracks' taps (taps_l/taps_r are separate
+        // params, so no aliasing).
+        let track = &mut tracks[i];
         for fx in track.fx_chain.iter_mut() {
-            fx.process(s_l, s_r);
+            let sc_idx = match fx {
+                FxNode::Compressor { sidechain_source: Some(src_id), .. } => id_index
+                    .iter()
+                    .find(|(id, _)| *id == *src_id)
+                    .map(|(_, idx)| *idx)
+                    .filter(|&j| j < n && j != i),
+                _ => None,
+            };
+            let aux = match sc_idx {
+                Some(j) => AuxInput {
+                    sidechain: Some((&taps_l[j][..frames], &taps_r[j][..frames])),
+                },
+                None => AuxInput::default(),
+            };
+            fx.process(
+                &mut scratch_l[..frames],
+                &mut scratch_r[..frames],
+                aux,
+            );
         }
 
-        // 3. Apply pan + track gain, sum into master.
         let (pan_l, pan_r) = track.pan_gains();
         let gain_l = track.gain * pan_l;
         let gain_r = track.gain * pan_r;
-        for i in 0..ctx.frames {
-            out_l[i] += s_l[i] * gain_l;
-            out_r[i] += s_r[i] * gain_r;
+        for k in 0..frames {
+            out_l[k] += scratch_l[k] * gain_l;
+            out_r[k] += scratch_r[k] * gain_r;
         }
     }
 }
@@ -157,6 +194,9 @@ fn mix_clip_into_scratch(
 pub fn process(
     transport: &mut Transport,
     tracks: &mut [Track],
+    taps_l: &mut [Vec<f32>],
+    taps_r: &mut [Vec<f32>],
+    id_index: &[(TrackId, usize)],
     scratch_l: &mut [f32],
     scratch_r: &mut [f32],
     out_l: &mut [f32],
@@ -170,7 +210,9 @@ pub fn process(
         frames,
         playing: transport.playing,
     };
-    render_master(ctx, tracks, scratch_l, scratch_r, out_l, out_r);
+    render_master(
+        ctx, tracks, taps_l, taps_r, id_index, scratch_l, scratch_r, out_l, out_r,
+    );
     if transport.playing {
         transport.advance(frames as u64)
     } else {
@@ -200,6 +242,15 @@ mod tests {
         vec![0.0; n]
     }
 
+    /// Build per-track tap buffers + id_index for the given tracks and frame
+    /// count. Test-only convenience so each test isn't 6 lines of setup.
+    fn ctx_for(tracks: &[Track], frames: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<(TrackId, usize)>) {
+        let tl = tracks.iter().map(|_| vec![0.0; frames]).collect();
+        let tr = tracks.iter().map(|_| vec![0.0; frames]).collect();
+        let idx = tracks.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
+        (tl, tr, idx)
+    }
+
     #[test]
     fn silence_when_stopped() {
         let mut t = Transport::new(48_000.0);
@@ -209,7 +260,10 @@ mod tests {
         let mut sl = buf(128);
         let mut sr = buf(128);
         let mut tracks: Vec<Track> = vec![];
-        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
+        let (mut tl, mut tr, idx) = ctx_for(&tracks, 128);
+        process(
+            &mut t, &mut tracks, &mut tl, &mut tr, &idx, &mut sl, &mut sr, &mut l, &mut r,
+        );
         assert!(l.iter().all(|&s| s == 0.0));
         assert!(r.iter().all(|&s| s == 0.0));
     }
@@ -234,7 +288,10 @@ mod tests {
         let mut sl = buf(128);
         let mut sr = buf(128);
         let mut tracks = vec![track];
-        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
+        let (mut tl, mut tr, idx) = ctx_for(&tracks, 128);
+        process(
+            &mut t, &mut tracks, &mut tl, &mut tr, &idx, &mut sl, &mut sr, &mut l, &mut r,
+        );
 
         // Center pan ≈ sqrt(0.5). 0.5 * sqrt(0.5) ≈ 0.3536
         let expected = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
@@ -264,7 +321,10 @@ mod tests {
         let mut sl = buf(128);
         let mut sr = buf(128);
         let mut tracks = vec![track];
-        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
+        let (mut tl, mut tr, idx) = ctx_for(&tracks, 128);
+        process(
+            &mut t, &mut tracks, &mut tl, &mut tr, &idx, &mut sl, &mut sr, &mut l, &mut r,
+        );
         assert!(l.iter().all(|&s| s == 0.0));
     }
 
@@ -289,7 +349,10 @@ mod tests {
         let mut sl = buf(64);
         let mut sr = buf(64);
         let mut tracks = vec![track];
-        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
+        let (mut tl, mut tr, idx) = ctx_for(&tracks, 64);
+        process(
+            &mut t, &mut tracks, &mut tl, &mut tr, &idx, &mut sl, &mut sr, &mut l, &mut r,
+        );
         assert!(l.iter().all(|&s| s == 0.0));
     }
 
@@ -324,7 +387,10 @@ mod tests {
         let mut sl = buf(64);
         let mut sr = buf(64);
         let mut tracks = vec![track_a, track_b];
-        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
+        let (mut tl, mut tr, idx) = ctx_for(&tracks, 64);
+        process(
+            &mut t, &mut tracks, &mut tl, &mut tr, &idx, &mut sl, &mut sr, &mut l, &mut r,
+        );
 
         // Only track_b plays. Magnitude = 0.5 * sqrt(0.5)
         let expected = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
@@ -345,7 +411,10 @@ mod tests {
         let mut sl = buf(64);
         let mut sr = buf(64);
         let mut tracks: Vec<Track> = vec![];
-        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
+        let (mut tl, mut tr, idx) = ctx_for(&tracks, 64);
+        process(
+            &mut t, &mut tracks, &mut tl, &mut tr, &idx, &mut sl, &mut sr, &mut l, &mut r,
+        );
         // 80 + 64 = 144; wrap to 44
         assert_eq!(t.position_frames, 44);
     }
@@ -391,10 +460,80 @@ mod tests {
         let mut sl = buf(200);
         let mut sr = buf(200);
         let mut tracks = vec![track];
-        process(&mut t, &mut tracks, &mut sl, &mut sr, &mut l, &mut r);
-        // Peak should be near sample 80, well above the noise floor in
-        // surrounding samples.
+        let (mut tl, mut tr, idx) = ctx_for(&tracks, 200);
+        process(
+            &mut t, &mut tracks, &mut tl, &mut tr, &idx, &mut sl, &mut sr, &mut l, &mut r,
+        );
         assert!(l[80].abs() > 0.1, "expected a peak at 80, got {}", l[80]);
         assert!(l[10].abs() < 1e-3);
+    }
+
+    #[test]
+    fn sidechain_routes_from_other_track() {
+        // Two tracks: trigger (loud burst on track 1), target (quiet steady
+        // tone on track 2). Target carries a sidechain compressor sourced
+        // from track 1. Target's contribution to master should drop while
+        // the trigger is loud and recover when it's silent.
+        use crate::fx::compressor::Compressor;
+        use crate::fx::{FxId, FxNode};
+
+        let n = 4_800;
+        let trigger_samples: Vec<f32> =
+            (0..n).map(|i| if i < n / 2 { 0.8 } else { 0.0 }).collect();
+        let target_samples = vec![0.4f32; n];
+
+        let mut trigger = Track::new(TrackId(1));
+        trigger.add_clip(Clip {
+            id: ClipId(1),
+            source: mono_source(trigger_samples),
+            start_frame: 0,
+            length_frames: n as u64,
+            offset_in_source: 0,
+            gain: 1.0,
+        });
+
+        let mut target = Track::new(TrackId(2));
+        target.add_clip(Clip {
+            id: ClipId(2),
+            source: mono_source(target_samples),
+            start_frame: 0,
+            length_frames: n as u64,
+            offset_in_source: 0,
+            gain: 1.0,
+        });
+        // Mute the trigger so its own audio doesn't muddy the energy
+        // measurement of the target's master contribution. Sidechain still
+        // works because pass 1 fills taps regardless of mute.
+        trigger.mute = true;
+        let mut comp = Compressor::new(48_000.0);
+        comp.threshold_db = -20.0;
+        comp.ratio = 8.0;
+        comp.set_attack_ms(1.0);
+        comp.set_release_ms(50.0);
+        target.fx_chain.push(FxNode::Compressor {
+            id: FxId(1),
+            fx: comp,
+            sidechain_source: Some(TrackId(1)),
+        });
+
+        let mut t = Transport::new(48_000.0);
+        t.playing = true;
+        let mut l = buf(n);
+        let mut r = buf(n);
+        let mut sl = buf(n);
+        let mut sr = buf(n);
+        let mut tracks = vec![trigger, target];
+        let (mut tl, mut tr, idx) = ctx_for(&tracks, n);
+        process(
+            &mut t, &mut tracks, &mut tl, &mut tr, &idx, &mut sl, &mut sr, &mut l, &mut r,
+        );
+
+        // Energy in the first half (loud trigger) vs. second half (silent).
+        let early: f32 = (l[200..600].iter().map(|s| s.abs()).sum::<f32>()) / 400.0;
+        let late: f32 = (l[n - 400..n].iter().map(|s| s.abs()).sum::<f32>()) / 400.0;
+        assert!(
+            late > early * 1.5,
+            "expected sidechain duck — early={early}, late={late}",
+        );
     }
 }

@@ -23,6 +23,13 @@ pub struct Engine {
     /// allocates after warmup.
     scratch_l: Vec<f32>,
     scratch_r: Vec<f32>,
+    /// Pre-FX tap per track (parallel to `tracks`). Read by sidechain
+    /// compressors on later tracks. Resized lazily — see Engine::process.
+    taps_l: Vec<Vec<f32>>,
+    taps_r: Vec<Vec<f32>>,
+    /// (TrackId, index-into-tracks). Refilled each render so sidechain
+    /// lookups don't allocate inside the audio callback.
+    id_index: Vec<(crate::track::TrackId, usize)>,
     next_source_id: u32,
     next_track_id: u32,
     next_clip_id: u32,
@@ -37,6 +44,9 @@ impl Engine {
             sources: HashMap::new(),
             scratch_l: Vec::new(),
             scratch_r: Vec::new(),
+            taps_l: Vec::new(),
+            taps_r: Vec::new(),
+            id_index: Vec::new(),
             next_source_id: 1,
             next_track_id: 1,
             next_clip_id: 1,
@@ -77,7 +87,50 @@ impl Engine {
         c.set_attack_ms(attack_ms.clamp(0.1, 1000.0));
         c.set_release_ms(release_ms.clamp(1.0, 5000.0));
         c.makeup_db = makeup_db;
-        track.fx_chain.push(FxNode::Compressor { id, fx: c });
+        track.fx_chain.push(FxNode::Compressor {
+            id,
+            fx: c,
+            sidechain_source: None,
+        });
+        Some(id)
+    }
+
+    /// Add a sidechain-driven compressor: target track is compressed by the
+    /// signal of `source_track_id`. Same DSP as `add_compressor`, just with
+    /// the detector wired to another track's pre-FX tap.
+    pub fn add_sidechain_compressor(
+        &mut self,
+        target_track_id: TrackId,
+        source_track_id: TrackId,
+        threshold_db: f32,
+        ratio: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        makeup_db: f32,
+    ) -> Option<FxId> {
+        let sr = self.transport.sample_rate;
+        // Verify the source exists; the resolver in graph silently drops
+        // unknown sources, but we'd rather fail loudly at add time.
+        if !self.tracks.iter().any(|t| t.id == source_track_id) {
+            return None;
+        }
+        let track = self
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == target_track_id)?;
+        let id = FxId(self.next_fx_id);
+        self.next_fx_id += 1;
+        let mut c = Compressor::new(sr);
+        c.threshold_db = threshold_db;
+        c.ratio = ratio.max(1.0);
+        c.set_attack_ms(attack_ms.clamp(0.1, 1000.0));
+        c.set_release_ms(release_ms.clamp(1.0, 5000.0));
+        c.makeup_db = makeup_db;
+        track.fx_chain.push(FxNode::Compressor {
+            id,
+            fx: c,
+            sidechain_source: Some(source_track_id),
+        });
         Some(id)
     }
 
@@ -242,9 +295,31 @@ impl Engine {
             self.scratch_l.resize(frames, 0.0);
             self.scratch_r.resize(frames, 0.0);
         }
+        // Keep one tap pair per track; grow/shrink to match the current
+        // track count.
+        while self.taps_l.len() < self.tracks.len() {
+            self.taps_l.push(Vec::new());
+            self.taps_r.push(Vec::new());
+        }
+        while self.taps_l.len() > self.tracks.len() {
+            self.taps_l.pop();
+            self.taps_r.pop();
+        }
+        for buf in self.taps_l.iter_mut().chain(self.taps_r.iter_mut()) {
+            if buf.len() < frames {
+                buf.resize(frames, 0.0);
+            }
+        }
+        self.id_index.clear();
+        for (i, t) in self.tracks.iter().enumerate() {
+            self.id_index.push((t.id, i));
+        }
         graph::process(
             &mut self.transport,
             &mut self.tracks,
+            &mut self.taps_l,
+            &mut self.taps_r,
+            &self.id_index,
             &mut self.scratch_l,
             &mut self.scratch_r,
             out_l,

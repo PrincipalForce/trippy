@@ -324,17 +324,14 @@ function describeSuggestion(
 }
 
 function isEngineSupported(s: EngineCommandSuggestion): boolean {
-  // gain/pan + EQ/comp/delay are now wired through to the audio graph.
-  // Sidechain still requires cross-track signal routing that doesn't exist
-  // yet, so it remains preview-only.
+  // All current AI suggestion types now have engine plumbing.
   switch (s.type) {
     case "setTrackGain":
     case "setTrackPan":
     case "addEq":
     case "addCompressor":
     case "addDelay":
-      return true;
     case "sidechain":
-      return false;
+      return true;
   }
 }

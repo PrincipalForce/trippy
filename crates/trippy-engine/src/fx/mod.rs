@@ -31,13 +31,38 @@ pub trait Fx {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FxId(pub u32);
 
+/// Auxiliary inputs available to an FX node during `process`. Currently
+/// just an optional sidechain detector pair — but the struct gives us a
+/// stable place to add envelope follower outputs, beat-quantized triggers,
+/// etc. without changing the node signature again.
+#[derive(Clone, Copy, Default)]
+pub struct AuxInput<'a> {
+    /// Detector input for a sidechain compressor. (L, R) — same length as
+    /// the target buffers. When `None`, the node uses its own input as
+    /// the detector (the standard non-sidechain path).
+    pub sidechain: Option<(&'a [f32], &'a [f32])>,
+}
+
 /// Polymorphism without `dyn`. An enum dispatch keeps the audio thread
 /// allocation-free, lets `process` inline well, and gives us cheap
 /// pattern-matching for per-kind parameter updates from the wasm bridge.
 pub enum FxNode {
-    Eq { id: FxId, fx: eq::Eq },
-    Compressor { id: FxId, fx: compressor::Compressor },
-    Delay { id: FxId, fx: delay::Delay },
+    Eq {
+        id: FxId,
+        fx: eq::Eq,
+    },
+    Compressor {
+        id: FxId,
+        fx: compressor::Compressor,
+        /// When set, this compressor's detector reads from the named track's
+        /// pre-FX tap instead of its own input. Resolved by the graph at
+        /// render time; an invalid id is silently treated as "no sidechain".
+        sidechain_source: Option<crate::track::TrackId>,
+    },
+    Delay {
+        id: FxId,
+        fx: delay::Delay,
+    },
 }
 
 impl FxNode {
@@ -47,10 +72,15 @@ impl FxNode {
         }
     }
 
-    pub fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
+    pub fn process(&mut self, l: &mut [f32], r: &mut [f32], aux: AuxInput<'_>) {
         match self {
             FxNode::Eq { fx, .. } => fx.process(l, r),
-            FxNode::Compressor { fx, .. } => fx.process(l, r),
+            FxNode::Compressor { fx, .. } => match aux.sidechain {
+                Some((dl, dr)) if dl.len() == l.len() && dr.len() == r.len() => {
+                    fx.process_with_detector(l, r, dl, dr);
+                }
+                _ => fx.process(l, r),
+            },
             FxNode::Delay { fx, .. } => fx.process(l, r),
         }
     }
@@ -68,9 +98,11 @@ impl std::fmt::Debug for FxNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FxNode::Eq { id, .. } => f.debug_struct("Eq").field("id", id).finish_non_exhaustive(),
-            FxNode::Compressor { id, .. } => {
-                f.debug_struct("Compressor").field("id", id).finish_non_exhaustive()
-            }
+            FxNode::Compressor { id, sidechain_source, .. } => f
+                .debug_struct("Compressor")
+                .field("id", id)
+                .field("sidechain_source", sidechain_source)
+                .finish_non_exhaustive(),
             FxNode::Delay { id, .. } => {
                 f.debug_struct("Delay").field("id", id).finish_non_exhaustive()
             }

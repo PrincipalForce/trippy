@@ -241,6 +241,31 @@ export class AudioController {
     this.worker.postMessage({ type: "removeFx", trackId, fxId } satisfies EngineCommand);
   }
 
+  /** Add a sidechain compressor on `targetTrackId` whose detector reads
+   *  from `sourceTrackId`. Classic kick→bass pump. */
+  async addSidechainCompressor(opts: {
+    targetTrackId: number;
+    sourceTrackId: number;
+    thresholdDb: number;
+    ratio: number;
+    attackMs: number;
+    releaseMs: number;
+    makeupDb: number;
+  }): Promise<number> {
+    const ev = await this.request<Extract<EngineEvent, { type: "fxAdded" }>>((id) => ({
+      type: "addSidechainCompressor",
+      targetTrackId: opts.targetTrackId,
+      sourceTrackId: opts.sourceTrackId,
+      thresholdDb: opts.thresholdDb,
+      ratio: opts.ratio,
+      attackMs: opts.attackMs,
+      releaseMs: opts.releaseMs,
+      makeupDb: opts.makeupDb,
+      requestId: id,
+    }));
+    return ev.fxId;
+  }
+
   /** Render `frameCount` frames straight-through into a stereo-interleaved
    *  Float32Array. Pauses realtime playback for the duration of the render
    *  and restores transport position afterward. */

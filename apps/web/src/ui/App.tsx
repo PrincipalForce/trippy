@@ -944,7 +944,25 @@ export function App() {
                 });
                 break;
               }
-              // Sidechain still needs cross-track signal routing in the engine.
+              case "sidechain": {
+                const target = engineTrackIds.get(c.to);
+                const source = engineTrackIds.get(c.from);
+                if (target == null || source == null) break;
+                // The LLM's sidechain tool doesn't pass compressor params, so
+                // we default to a snappy "pumping" profile: fast attack,
+                // medium release, hot threshold, 6:1 ratio. Users can later
+                // tune via a removeFx + a fresh add_compressor.
+                void controller.addSidechainCompressor({
+                  targetTrackId: target,
+                  sourceTrackId: source,
+                  thresholdDb: -20,
+                  ratio: 6,
+                  attackMs: 1,
+                  releaseMs: 100,
+                  makeupDb: 0,
+                });
+                break;
+              }
               default:
                 break;
             }
